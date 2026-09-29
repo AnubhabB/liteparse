@@ -1091,8 +1091,12 @@ fn compress_wide_spaces(line: &str, min_run: usize, replace_with: usize) -> Stri
                 out.push_str(&" ".repeat(run_len));
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+            // ASCII spaces are UTF-8 boundaries, so this preserves the original text.
+            out.push_str(&line[start..i]);
         }
     }
     out
@@ -5164,6 +5168,32 @@ fn build_one_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compress_wide_spaces_preserves_utf8_text() {
+        assert_eq!(
+            compress_wide_spaces("売上高    1,234 Café  Größe", 4, 2),
+            "売上高  1,234 Café  Größe"
+        );
+    }
+
+    #[test]
+    fn sparse_blocks_preserve_utf8_text_when_compressing_columns() {
+        let labels = ["売上高", "営業利益", "Café", "Größe"];
+        let mut lines: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(120)))
+            .collect();
+        let end = lines.len();
+
+        fix_sparse_blocks(&mut lines, 0, end);
+
+        let expected: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}{}1,234", " ".repeat(FLOATING_SPACES)))
+            .collect();
+        assert_eq!(lines, expected);
+    }
 
     fn projected_item(text: &str, y: f32, width: f32, height: f32) -> ProjectedTextItem {
         ProjectedTextItem {
