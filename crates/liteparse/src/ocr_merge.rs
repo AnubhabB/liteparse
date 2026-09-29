@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::LiteParseError;
 use crate::ocr::{OcrEngine, OcrOptions, OcrResult};
-use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem};
+use crate::types::{CutAxis, Page, ParsedPage, Rect, Region, RegionKind, TextItem, WordBox};
 use pdfium::{Document, ImageBounds};
 use serde::{Deserialize, Serialize};
 
@@ -988,10 +988,19 @@ pub async fn recognize_rasters(
 /// Outcomes are matched to pages by `page_number`; an outcome for a page not
 /// in `pages` is an error rather than a panic, so a caller can merge a
 /// subset of pages or hand-built outcomes safely.
+///
+/// `emit_word_boxes` must match what the extraction stage used
+/// (`LiteParseConfig::effective_emit_word_boxes`). An engine reports one
+/// [`OcrResult`] per word, so each surviving result becomes a one-word
+/// [`TextItem`]; the item's own word box is attached here, which is what lets
+/// the projection pass merge neighbouring OCR items into a run that still
+/// carries per-word boxes. When `false`, no box is attached, matching the
+/// zero-allocation promise the config makes for native text.
 pub fn merge_ocr_results(
     pages: &mut [Page],
     outcomes: Vec<PageOcrOutcome>,
     ocr_failure_fatal: bool,
+    emit_word_boxes: bool,
 ) -> Result<(), LiteParseError> {
     // Track OCR task outcomes so we can distinguish a systemic failure (e.g.
     // missing Tesseract language data, which fails identically on every page)
@@ -1195,6 +1204,21 @@ pub fn merge_ocr_results(
                 ocr_h
             };
 
+            // The engine already segmented this result as a single word, so
+            // its box is the item's box. The clone only happens when the
+            // caller asked for word boxes.
+            let words = if emit_word_boxes {
+                vec![WordBox {
+                    text: cleaned.clone(),
+                    x: ocr_x,
+                    y: ocr_y,
+                    width: ocr_w,
+                    height: ocr_h,
+                }]
+            } else {
+                Vec::new()
+            };
+
             page.text_items.push(TextItem {
                 text: cleaned,
                 x: ocr_x,
@@ -1205,6 +1229,7 @@ pub fn merge_ocr_results(
                 font_name: Some("OCR".to_string()),
                 font_size: Some(font_size_hint),
                 confidence: Some((r.confidence * 1000.0).round() / 1000.0),
+                words,
                 ..Default::default()
             });
         }
@@ -2225,9 +2250,10 @@ mod tests {
         language: &str,
         num_workers: usize,
         ocr_failure_fatal: bool,
+        emit_word_boxes: bool,
     ) -> Result<(), LiteParseError> {
         let outcomes = recognize_rasters(rendered, engine, language, num_workers).await;
-        merge_ocr_results(pages, outcomes, ocr_failure_fatal)
+        merge_ocr_results(pages, outcomes, ocr_failure_fatal, emit_word_boxes)
     }
 
     // A page that already has substantial native text coverage, as would be the
@@ -2295,7 +2321,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("expected systemic OCR failure to be surfaced");
         let msg = err.to_string();
@@ -2316,7 +2343,8 @@ mod tests {
         let mut pages = vec![make_blank_page(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, Vec::new(), engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, Vec::new(), engine, "eng", 2, true, false).await;
 
         assert!(result.is_ok(), "empty OCR set should succeed: {result:?}");
     }
@@ -2330,7 +2358,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         assert!(
             result.is_ok(),
@@ -2350,7 +2379,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("a text-starved page losing all OCR must surface an error");
         assert!(
@@ -2368,7 +2398,8 @@ mod tests {
         let rendered = vec![make_rendered(0)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, true, false).await;
 
         let err = result.expect_err("low-coverage text page losing OCR must surface an error");
         assert!(
@@ -2387,7 +2418,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, false).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, engine, "eng", 2, false, false).await;
 
         assert!(
             result.is_ok(),
@@ -2395,5 +2427,62 @@ mod tests {
         );
         // The native-text page keeps its text; the blank page simply has no OCR.
         assert_eq!(pages[0].text_items.len(), 1);
+    }
+
+    /// An OCR-sourced `TextItem` must carry a word box the way a native one
+    /// does. The engine already reports one word per result (`RIL_WORD` for
+    /// Tesseract), so the item's own text and box are the word box. Without
+    /// it the projection pass has nothing to carry forward when it joins
+    /// neighbouring OCR items into a run, so a caller asking for word boxes
+    /// gets them on native text only and none on scanned pages (#473).
+    #[test]
+    fn test_ocr_items_carry_word_boxes_when_enabled() {
+        let outcome = |page_number: usize| PageOcrOutcome {
+            page_number,
+            dpi: 72.0,
+            has_native_text: false,
+            image_rects: Vec::new(),
+            results: vec![
+                OcrResult {
+                    text: "hello".into(),
+                    bbox: [10.0, 20.0, 60.0, 30.0],
+                    confidence: 0.9,
+                    polygon: None,
+                },
+                OcrResult {
+                    text: "world".into(),
+                    bbox: [62.0, 20.0, 110.0, 30.0],
+                    confidence: 0.9,
+                    polygon: None,
+                },
+            ],
+            error: None,
+        };
+
+        let mut enabled = vec![make_blank_page(1)];
+        merge_ocr_results(&mut enabled, vec![outcome(1)], false, true).unwrap();
+        assert_eq!(enabled[0].text_items.len(), 2);
+        for item in &enabled[0].text_items {
+            assert_eq!(
+                item.words.len(),
+                1,
+                "OCR item {:?} should carry one word box",
+                item.text
+            );
+            let word = &item.words[0];
+            assert_eq!(word.text, item.text);
+            assert_eq!(
+                (word.x, word.y, word.width, word.height),
+                (item.x, item.y, item.width, item.height),
+                "the word box is the result's own box"
+            );
+        }
+
+        // The same input with word boxes off must stay allocation-free, as
+        // `LiteParseConfig::emit_word_boxes` promises for native text.
+        let mut disabled = vec![make_blank_page(1)];
+        merge_ocr_results(&mut disabled, vec![outcome(1)], false, false).unwrap();
+        assert_eq!(disabled[0].text_items.len(), 2);
+        assert!(disabled[0].text_items.iter().all(|i| i.words.is_empty()));
     }
 }
