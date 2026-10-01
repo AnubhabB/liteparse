@@ -1454,8 +1454,20 @@ fn garbled_scope(page: &Page) -> GarbledScope {
     }
 }
 
+/// Page-level garbled signal: substitution-cipher text (see [`garbled_scope`])
+/// or a substantial share of text whose Unicode mapping failed outright.
 fn page_is_garbled(page: &Page) -> bool {
-    !matches!(garbled_scope(page), GarbledScope::None)
+    !matches!(garbled_scope(page), GarbledScope::None) || page_has_unmapped_text(page)
+}
+
+/// True when text with a failed Unicode mapping is both a real amount (not a
+/// stray Type3 symbol glyph) and a real share of the page's native text.
+fn page_has_unmapped_text(page: &Page) -> bool {
+    let (unmapped, total) = page.text_items.iter().fold((0usize, 0usize), |(u, t), it| {
+        let n = it.text.chars().filter(|c| !c.is_whitespace()).count();
+        (u + if it.has_unicode_map_error { n } else { 0 }, t + n)
+    });
+    unmapped >= GARBLE_MIN_LETTERS && unmapped as f32 >= total as f32 * GARBLE_MIN_FONT_SHARE
 }
 
 /// Recover a discrete CCW rotation in degrees from a 4-point OCR polygon.
@@ -2198,6 +2210,51 @@ mod tests {
             _ => panic!("expected only the corrupt font group to be flagged"),
         }
         assert!(page_is_garbled(&page));
+    }
+
+    /// A page of unmappable text (PUA char-code fallback) has no ASCII letters
+    /// for the vowel ratio to judge, and every item is excluded from
+    /// `text_length` — it must still report as garbled.
+    #[test]
+    fn test_page_is_garbled_unmapped_text() {
+        let mut page = make_font_page(&[
+            (
+                "T3Font",
+                "\u{E001}\u{E002}\u{E003}\u{E004}\u{E005}\u{E006}\u{E007}\u{E008}",
+            ),
+            (
+                "T3Font",
+                "\u{E011}\u{E012}\u{E013}\u{E014}\u{E015}\u{E016}\u{E017}\u{E018}",
+            ),
+            (
+                "T3Font",
+                "\u{E021}\u{E022}\u{E023}\u{E024}\u{E025}\u{E026}\u{E027}\u{E028}",
+            ),
+            (
+                "T3Font",
+                "\u{E031}\u{E032}\u{E033}\u{E034}\u{E035}\u{E036}\u{E037}\u{E038}",
+            ),
+        ]);
+        for it in &mut page.text_items {
+            it.has_unicode_map_error = true;
+        }
+        assert!(matches!(garbled_scope(&page), GarbledScope::None));
+        assert_eq!(native_text_length(&page), 0);
+        assert!(page_is_garbled(&page));
+    }
+
+    /// A stray unmappable symbol glyph (e.g. a Type3 checkmark) on a healthy
+    /// page must not flag it.
+    #[test]
+    fn test_page_is_garbled_ignores_stray_unmapped_glyph() {
+        let mut items: Vec<(&str, &str)> = HEALTHY_PARAGRAPH
+            .iter()
+            .map(|t| ("Helvetica", *t))
+            .collect();
+        items.push(("T3Font", "\u{E001}"));
+        let mut page = make_font_page(&items);
+        page.text_items.last_mut().unwrap().has_unicode_map_error = true;
+        assert!(!page_is_garbled(&page));
     }
 
     /// A small run of low-vowel text (acronyms, tickers, part numbers) in its
