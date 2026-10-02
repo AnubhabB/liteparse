@@ -6,7 +6,8 @@
 //! normalisation, no dedup — so its output is a stable function of what pdfium
 //! reports and a consumer can build its own segmentation on top. Glyphs hidden by
 //! known rectangular clips are omitted before grouping; partially clipped glyphs
-//! are kept when their loose-box centre is inside. Unknown clips preserve text.
+//! are kept in full whenever their loose box intersects the clip. Unknown clips
+//! preserve text.
 //!
 //! Rules:
 //!

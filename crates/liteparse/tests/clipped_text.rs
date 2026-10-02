@@ -79,9 +79,9 @@ fn clipped_overflow_does_not_leak_into_next_row() {
 }
 
 #[test]
-fn horizontal_partial_glyphs_use_centre_and_page_rotation_does_not_matter() {
+fn horizontal_partial_glyphs_survive_in_full_at_every_page_rotation() {
     for rotation in [0, 90, 180, 270] {
-        for (edge, expected) in [(26, "ABC"), (24, "AB")] {
+        for (edge, expected) in [(26, "ABC"), (24, "ABC"), (22, "ABC"), (21, "AB")] {
             let content = format!(
                 "q 10 10 {} 30 re W n BT /F1 10 Tf 10 20 Td (ABCDE) Tj ET Q",
                 edge - 10
@@ -102,13 +102,13 @@ fn nested_forms_compose_transforms_and_inherit_outer_clips() {
         "2 0 0 2 10 15 cm /Inner Do",
     );
     let content = "q 100 100 35 300 re W n 1 0 0 1 100 100 cm /Outer Do Q";
-    assert_text(&pdf(content, &[&outer, &inner], 0), "A");
+    assert_text(&pdf(content, &[&outer, &inner], 0), "AB");
 }
 
 #[test]
 fn form_bbox_clips_text_without_explicit_clip_operator() {
     let form = stream(
-        "/Type /XObject /Subtype /Form /BBox [0 0 18 100] /Resources << /Font << /F1 4 0 R >> >>",
+        "/Type /XObject /Subtype /Form /BBox [0 0 17 100] /Resources << /Font << /F1 4 0 R >> >>",
         "BT /F1 10 Tf 0 20 Td (ABCDE) Tj ET",
     );
     assert_text(&pdf("1 0 0 1 100 100 cm /Outer Do", &[&form], 0), "ABC");
@@ -117,7 +117,7 @@ fn form_bbox_clips_text_without_explicit_clip_operator() {
 #[test]
 fn stacked_clips_intersect_and_restore_does_not_leak() {
     let content = "q 0 0 100 100 re W n 10 10 14 30 re W* n BT /F1 10 Tf 10 20 Td (ABCDE) Tj ET Q BT /F1 10 Tf 100 100 Td (RESTORED) Tj ET";
-    assert_text(&pdf(content, &[], 0), "AB RESTORED");
+    assert_text(&pdf(content, &[], 0), "ABC RESTORED");
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn content_matrix_is_not_applied_to_clip_twice() {
             &[],
             0,
         ),
-        "AB",
+        "ABC",
     );
 }
 
@@ -182,4 +182,26 @@ fn unsupported_parent_clip_preserves_form_text() {
         &pdf("0 0 m 1 0 l 1 1 l h W n /Outer Do", &[&form], 0),
         "KEEP",
     );
+}
+
+#[test]
+fn partial_glyphs_keep_the_full_text_and_geometry_at_all_clip_edges() {
+    let text = "BT /F1 10 Tf 10 20 Td (A) Tj ET";
+    let original = extract(&pdf(text, &[], 0));
+    let glyph = original.0.iter().find(|item| item.text == "A").unwrap();
+    // Raw item coordinates have a top-left origin; content streams use y-up.
+    let left = glyph.x;
+    let right = left + glyph.width;
+    let top = 800.0 - glyph.y;
+    let bottom = top - glyph.height;
+    let clips = [
+        (left - 1.0, bottom - 1.0, 1.1, glyph.height + 2.0),
+        (right - 0.1, bottom - 1.0, 1.1, glyph.height + 2.0),
+        (left - 1.0, bottom - 1.0, glyph.width + 2.0, 1.1),
+        (left - 1.0, top - 0.1, glyph.width + 2.0, 1.1),
+    ];
+    for (x, y, width, height) in clips {
+        let content = format!("q {x} {y} {width} {height} re W n {text} Q");
+        assert_eq!(extract(&pdf(&content, &[], 0)), original);
+    }
 }

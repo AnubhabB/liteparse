@@ -92,7 +92,7 @@ impl TextClip {
     }
 
     /// Generated separators have no reliable source object and are preserved.
-    /// Partially clipped glyphs survive when their loose-box centre is inside.
+    /// Any intersection with the loose glyph box preserves the complete glyph.
     pub(crate) fn hides(&self, cv: &CharView<'_, '_>) -> bool {
         if cv.is_generated() {
             return false;
@@ -114,16 +114,14 @@ impl TextClip {
         {
             return false;
         }
-        let x = f64::from(glyph.left) * 0.5 + f64::from(glyph.right) * 0.5;
-        let y = f64::from(glyph.bottom) * 0.5 + f64::from(glyph.top) * 0.5;
         // A tiny tolerance prevents float rounding at a clip edge losing a glyph.
         const EPS: f64 = 0.001;
         bounds.left > bounds.right
             || bounds.bottom > bounds.top
-            || x < f64::from(bounds.left) - EPS
-            || x > f64::from(bounds.right) + EPS
-            || y < f64::from(bounds.bottom) - EPS
-            || y > f64::from(bounds.top) + EPS
+            || f64::from(glyph.right) < f64::from(bounds.left) - EPS
+            || f64::from(glyph.left) > f64::from(bounds.right) + EPS
+            || f64::from(glyph.top) < f64::from(bounds.bottom) - EPS
+            || f64::from(glyph.bottom) > f64::from(bounds.top) + EPS
     }
 }
 
