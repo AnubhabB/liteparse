@@ -92,7 +92,7 @@ impl TextClip {
     }
 
     /// Generated separators have no reliable source object and are preserved.
-    /// Any intersection with the loose glyph box preserves the complete glyph.
+    /// Any intersection with the glyph's ink box preserves the complete glyph.
     pub(crate) fn hides(&self, cv: &CharView<'_, '_>) -> bool {
         if cv.is_generated() {
             return false;
@@ -103,7 +103,14 @@ impl TextClip {
         else {
             return false;
         };
-        let Some(glyph) = cv.loose_char_box().or_else(|| cv.strict_char_box()) else {
+        // The ink (strict) box decides: a loose box carries the font's side bearings and
+        // ascent, so it can graze a clip edge by a fraction of a point while every pixel of
+        // the glyph lies outside. Whitespace and inkless glyphs keep the loose box.
+        let inked = !char::from_u32(cv.unicode()).is_some_and(char::is_whitespace);
+        let strict = cv
+            .strict_char_box()
+            .filter(|b| inked && b.right > b.left && b.top > b.bottom);
+        let Some(glyph) = strict.or_else(|| cv.loose_char_box()) else {
             return false;
         };
         if ![glyph.left, glyph.right, glyph.bottom, glyph.top]
