@@ -32,6 +32,18 @@ fn table_column_count(block: &Block) -> usize {
     }
 }
 
+fn filled_cell_count(block: &Block) -> usize {
+    match block {
+        Block::Table { header, rows } => header
+            .iter()
+            .flat_map(|row| row.iter())
+            .chain(rows.iter().flat_map(|row| row.iter()))
+            .filter(|cell| !cell.text.trim().is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
 /// A document-order page interruption that breaks the normal text flow: either
 /// a horizontal rule (from vector graphics) or a figure injection (a raster
 /// image ref). Collected into one y-sorted stream so the two kinds interleave
@@ -196,22 +208,19 @@ pub fn classify_page_with_filters(
         if groups.len() < 2 {
             continue;
         }
-        // If any single leaf's share of these lines already forms a table
-        // on its own, the per-region path handles this content — don't
-        // override (a decorative frame can span a data table plus surrounding
-        // prose; the data region tables cleanly by itself, while the frame
-        // would fuse prose into garbage cells).
-        // The leaf must also hold a material share of the run. A leaf with a
-        // handful of the lines - a landscape slide's title band sitting above
-        // the table, which tables "successfully" on its own as a row of
-        // gutter-split title fragments - is not evidence that the per-region
-        // path has this content covered; vetoing on it drops the whole table
-        // and spills its body rows into prose.
+        // A local table vetoes the global run only when it has at least two
+        // columns, a material share of the lines, and at least 60% of the
+        // global run's filled cells. This preserves the decorative-frame
+        // case: the data region has more filled cells than the prose-fused
+        // frame, so its local table still vetoes the global candidate.
         let already_handled = groups.values().any(|idxs| {
             if idxs.len() < 2 || idxs.len() * 4 < consumed.len() {
                 return false;
             }
             let sub: Vec<ProjectedLine> = idxs.iter().map(|&i| lines[i].clone()).collect();
+            let global_filled = filled_cell_count(&run.block);
+            let covers_global =
+                |block: &Block| filled_cell_count(block) as f32 >= 0.6 * global_filled as f32;
             super::tables::detect_ruled_tables(
                 &sub,
                 &rule_segments,
@@ -219,8 +228,10 @@ pub fn classify_page_with_filters(
                 page.page_height,
             )
             .iter()
-            .any(|r| table_column_count(&r.block) >= 2)
-                || !super::tables::detect_tables(&sub).is_empty()
+            .any(|r| table_column_count(&r.block) >= 2 && covers_global(&r.block))
+                || super::tables::detect_tables(&sub)
+                    .iter()
+                    .any(|r| table_column_count(&r.block) >= 2 && covers_global(&r.block))
         });
         if already_handled {
             continue;
@@ -1576,6 +1587,77 @@ mod tests {
             "missing current value: {cells:?}"
         );
         assert!(cells.contains(&"$900"), "missing prior value: {cells:?}");
+    }
+
+    #[test]
+    fn global_ruled_table_survives_sparse_two_column_leaf_veto() {
+        let rows = [
+            ("Account", "Current Value", "$900", "$800", "$700"),
+            ("Cash", "$1,000", "$900", "$800", "$700"),
+            ("Debt", "$500", "$600", "$700", "$800"),
+            ("Equity", "$500", "$300", "$200", "$100"),
+        ];
+        let mut label_lines = Vec::new();
+        let mut middle_value_lines = Vec::new();
+        let mut last_value_lines = Vec::new();
+        for (row_idx, (label, first, second, third, fourth)) in rows.iter().enumerate() {
+            let y = 100.0 + row_idx as f32 * 25.0;
+            let mut label_line = line_with_spans(&[(*label, 100.0), (*first, 160.0)], y, 10.0);
+            label_line.region_path = vec![0];
+            label_lines.push(label_line);
+
+            let mut middle_values = line_with_spans(&[(*second, 230.0), (*third, 300.0)], y, 8.0);
+            middle_values.region_path = vec![1];
+            middle_value_lines.push(middle_values);
+
+            let mut last_value = line_with_spans(&[(*fourth, 370.0)], y, 8.0);
+            last_value.region_path = vec![2];
+            last_value_lines.push(last_value);
+        }
+        label_lines.extend(middle_value_lines);
+        label_lines.extend(last_value_lines);
+
+        let mut graphics = Vec::new();
+        for y in [90.0, 115.0, 140.0, 165.0, 190.0] {
+            graphics.push(stroke(80.0, y, 430.0, y, 0.5));
+        }
+        for x in [80.0, 150.0, 220.0, 290.0, 360.0, 430.0] {
+            graphics.push(stroke(x, 90.0, x, 190.0, 0.5));
+        }
+        let page = page_with_graphics(label_lines, graphics);
+        let label_leaf = &page.projected_lines[..rows.len()];
+        let label_runs = super::super::tables::detect_tables(label_leaf);
+        assert!(
+            label_runs.iter().any(|run| {
+                table_column_count(&run.block) == 2 && filled_cell_count(&run.block) == 8
+            }),
+            "the label leaf should independently form a sparse two-column table: {label_runs:?}"
+        );
+
+        let blocks = classify_page(&page, &[]);
+        let table = blocks
+            .iter()
+            .find_map(|block| match &block.block {
+                Block::Table { header, rows } => Some((header, rows)),
+                _ => None,
+            })
+            .expect("the global ruled pass should emit the fuller scattered table");
+        let (header, rows) = table;
+        let col_count = header
+            .as_ref()
+            .map(Vec::len)
+            .or_else(|| rows.first().map(Vec::len))
+            .unwrap_or(0);
+        assert_eq!(col_count, 5, "expected the label and four value columns");
+        let cells = header
+            .iter()
+            .flat_map(|cells| cells.iter())
+            .chain(rows.iter().flat_map(|row| row.iter()))
+            .map(|cell| cell.text.as_str())
+            .collect::<Vec<_>>();
+        for value in ["$1,000", "$900", "$800", "$700", "$600", "$100"] {
+            assert!(cells.contains(&value), "missing {value}: {cells:?}");
+        }
     }
 
     #[test]
