@@ -44,6 +44,27 @@ fn filled_cell_count(block: &Block) -> usize {
     }
 }
 
+fn numeric_filled_cell_count(block: &Block) -> usize {
+    match block {
+        Block::Table { header, rows } => header
+            .iter()
+            .flat_map(|row| row.iter())
+            .chain(rows.iter().flat_map(|row| row.iter()))
+            .filter(|cell| cell.text.bytes().any(|byte| byte.is_ascii_digit()))
+            .count(),
+        _ => 0,
+    }
+}
+
+fn table_covers_global(local: &Block, global: &Block) -> bool {
+    let global_numeric = numeric_filled_cell_count(global);
+    if global_numeric == 0 {
+        filled_cell_count(local) as f32 >= 0.6 * filled_cell_count(global) as f32
+    } else {
+        numeric_filled_cell_count(local) as f32 >= 0.6 * global_numeric as f32
+    }
+}
+
 /// A document-order page interruption that breaks the normal text flow: either
 /// a horizontal rule (from vector graphics) or a figure injection (a raster
 /// image ref). Collected into one y-sorted stream so the two kinds interleave
@@ -210,17 +231,17 @@ pub fn classify_page_with_filters(
         }
         // A local table vetoes the global run only when it has at least two
         // columns, a material share of the lines, and at least 60% of the
-        // global run's filled cells. This preserves the decorative-frame
-        // case: the data region has more filled cells than the prose-fused
-        // frame, so its local table still vetoes the global candidate.
+        // global run's numeric cells. Newmark p91's local label grid has 20/29
+        // filled cells but almost none of the values, which sit around
+        // x=500–530 outside its x=72–500 grid. A true data-region table still
+        // vetoes; a prose-fused decorative frame has few numbers to compare.
+        // If the global run has no numbers, retain the filled-cell fallback.
         let already_handled = groups.values().any(|idxs| {
             if idxs.len() < 2 || idxs.len() * 4 < consumed.len() {
                 return false;
             }
             let sub: Vec<ProjectedLine> = idxs.iter().map(|&i| lines[i].clone()).collect();
-            let global_filled = filled_cell_count(&run.block);
-            let covers_global =
-                |block: &Block| filled_cell_count(block) as f32 >= 0.6 * global_filled as f32;
+            let covers_global = |block: &Block| table_covers_global(block, &run.block);
             super::tables::detect_ruled_tables(
                 &sub,
                 &rule_segments,
@@ -1590,12 +1611,64 @@ mod tests {
     }
 
     #[test]
+    fn global_veto_uses_filled_cells_when_numeric_count_is_zero() {
+        let local = Block::Table {
+            header: None,
+            rows: vec![vec!["Label".into(), "Description".into()]],
+        };
+        let global = Block::Table {
+            header: None,
+            rows: vec![vec!["Label".into(), "Current".into(), "Prior".into()]],
+        };
+        assert_eq!(numeric_filled_cell_count(&global), 0);
+        assert!(table_covers_global(&local, &global));
+
+        let sparse_local = Block::Table {
+            header: None,
+            rows: vec![vec!["Label".into(), "".into()]],
+        };
+        assert!(!table_covers_global(&sparse_local, &global));
+    }
+
+    #[test]
+    fn global_veto_numeric_coverage_distinguishes_data_from_prose_frame() {
+        let global = Block::Table {
+            header: None,
+            rows: vec![vec![
+                "Asset".into(),
+                "100".into(),
+                "200".into(),
+                "300".into(),
+                "400".into(),
+                "500".into(),
+            ]],
+        };
+        let data_region = Block::Table {
+            header: None,
+            rows: vec![vec!["100".into(), "200".into(), "300".into()]],
+        };
+        let prose_frame = Block::Table {
+            header: None,
+            rows: vec![vec![
+                "Narrative".into(),
+                "1".into(),
+                "Additional prose".into(),
+                "Footer".into(),
+            ]],
+        };
+
+        assert!(table_covers_global(&data_region, &global));
+        assert!(filled_cell_count(&prose_frame) as f32 >= 0.6 * filled_cell_count(&global) as f32);
+        assert!(!table_covers_global(&prose_frame, &global));
+    }
+
+    #[test]
     fn global_ruled_table_survives_sparse_two_column_leaf_veto() {
         let rows = [
-            ("Account", "Current Value", "$900", "$800", "$700"),
-            ("Cash", "$1,000", "$900", "$800", "$700"),
-            ("Debt", "$500", "$600", "$700", "$800"),
-            ("Equity", "$500", "$300", "$200", "$100"),
+            ("Account", "Current Period", Some("$900"), None, None),
+            ("Cash", "Cash Position", Some("$1,000"), None, None),
+            ("Debt", "Long-Term Debt", None, None, Some("$600")),
+            ("Equity", "1", None, None, Some("$100")),
         ];
         let mut label_lines = Vec::new();
         let mut middle_value_lines = Vec::new();
@@ -1606,13 +1679,21 @@ mod tests {
             label_line.region_path = vec![0];
             label_lines.push(label_line);
 
-            let mut middle_values = line_with_spans(&[(*second, 230.0), (*third, 300.0)], y, 8.0);
-            middle_values.region_path = vec![1];
-            middle_value_lines.push(middle_values);
+            let middle_spans: Vec<(&str, f32)> = [(*second, 230.0), (*third, 300.0)]
+                .into_iter()
+                .filter_map(|(text, x)| text.map(|text| (text, x)))
+                .collect();
+            if !middle_spans.is_empty() {
+                let mut middle_values = line_with_spans(&middle_spans, y, 8.0);
+                middle_values.region_path = vec![1];
+                middle_value_lines.push(middle_values);
+            }
 
-            let mut last_value = line_with_spans(&[(*fourth, 370.0)], y, 8.0);
-            last_value.region_path = vec![2];
-            last_value_lines.push(last_value);
+            if let Some(text) = fourth {
+                let mut last_value = line_with_spans(&[(*text, 370.0)], y, 8.0);
+                last_value.region_path = vec![2];
+                last_value_lines.push(last_value);
+            }
         }
         label_lines.extend(middle_value_lines);
         label_lines.extend(last_value_lines);
@@ -1627,11 +1708,33 @@ mod tests {
         let page = page_with_graphics(label_lines, graphics);
         let label_leaf = &page.projected_lines[..rows.len()];
         let label_runs = super::super::tables::detect_tables(label_leaf);
+        let label_run = label_runs
+            .iter()
+            .find(|run| table_column_count(&run.block) == 2)
+            .expect("the label leaf should independently form a two-column table");
+        assert_eq!(filled_cell_count(&label_run.block), 8);
+        assert_eq!(numeric_filled_cell_count(&label_run.block), 1);
+
+        let rule_segments = super::super::tables::extract_rule_segments(&page.graphics);
+        let global_run = super::super::tables::detect_ruled_tables_global(
+            &page.projected_lines,
+            &rule_segments,
+            page.page_width,
+            page.page_height,
+        )
+        .into_iter()
+        .find(|(run, _)| table_column_count(&run.block) == 5)
+        .expect("the page-wide detector should find the five-column table")
+        .0;
         assert!(
-            label_runs.iter().any(|run| {
-                table_column_count(&run.block) == 2 && filled_cell_count(&run.block) == 8
-            }),
-            "the label leaf should independently form a sparse two-column table: {label_runs:?}"
+            filled_cell_count(&label_run.block) as f32
+                >= 0.6 * filled_cell_count(&global_run.block) as f32,
+            "the old filled-cell criterion would veto this global run"
+        );
+        assert!(
+            (numeric_filled_cell_count(&label_run.block) as f32)
+                < 0.6 * numeric_filled_cell_count(&global_run.block) as f32,
+            "the label-side table should not cover the global numeric cells"
         );
 
         let blocks = classify_page(&page, &[]);
@@ -1655,8 +1758,11 @@ mod tests {
             .chain(rows.iter().flat_map(|row| row.iter()))
             .map(|cell| cell.text.as_str())
             .collect::<Vec<_>>();
-        for value in ["$1,000", "$900", "$800", "$700", "$600", "$100"] {
-            assert!(cells.contains(&value), "missing {value}: {cells:?}");
+        for value in ["$900", "$1,000", "$600", "$100"] {
+            assert!(
+                cells.iter().any(|cell| cell.contains(value)),
+                "missing {value}: {cells:?}"
+            );
         }
     }
 
