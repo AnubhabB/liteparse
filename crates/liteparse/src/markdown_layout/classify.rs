@@ -21,6 +21,17 @@ use super::paragraphs::{
 use super::repetition::is_header_or_footer;
 use super::tables::{detect_ruled_tables, detect_tables_banded, merge_table_runs};
 
+fn table_column_count(block: &Block) -> usize {
+    match block {
+        Block::Table { header, rows } => header
+            .as_ref()
+            .map(|h| h.len())
+            .or_else(|| rows.first().map(Vec::len))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// A document-order page interruption that breaks the normal text flow: either
 /// a horizontal rule (from vector graphics) or a figure injection (a raster
 /// image ref). Collected into one y-sorted stream so the two kinds interleave
@@ -201,13 +212,14 @@ pub fn classify_page_with_filters(
                 return false;
             }
             let sub: Vec<ProjectedLine> = idxs.iter().map(|&i| lines[i].clone()).collect();
-            !super::tables::detect_ruled_tables(
+            super::tables::detect_ruled_tables(
                 &sub,
                 &rule_segments,
                 page.page_width,
                 page.page_height,
             )
-            .is_empty()
+            .iter()
+            .any(|r| table_column_count(&r.block) >= 2)
                 || !super::tables::detect_tables(&sub).is_empty()
         });
         if already_handled {
@@ -220,15 +232,8 @@ pub fn classify_page_with_filters(
         // region is a framed text box, never tabular. Word-count gating can't
         // be used here: genuine scattered description grids have equally long
         // cells.
-        if let Block::Table { header, rows } = &run.block {
-            let cols = header
-                .as_ref()
-                .map(|h| h.len())
-                .or_else(|| rows.first().map(Vec::len))
-                .unwrap_or(0);
-            if cols < 2 {
-                continue;
-            }
+        if table_column_count(&run.block) < 2 {
+            continue;
         }
         let top_y = consumed
             .iter()
@@ -1235,7 +1240,8 @@ mod tests {
     use super::super::headings::{build_heading_map, compute_body_size};
     use super::super::repetition::compute_header_footer_set;
     use super::super::test_helpers::{
-        header_footer_page, line, mono_line, page, page_with_graphics, stroke, styled_line,
+        header_footer_page, line, line_with_spans, mono_line, page, page_with_graphics, stroke,
+        styled_line,
     };
     use super::*;
     use crate::types::TextItem;
@@ -1460,7 +1466,6 @@ mod tests {
 
     #[test]
     fn detects_simple_borderless_table() {
-        use super::super::test_helpers::line_with_spans;
         let lines = vec![
             line_with_spans(
                 &[("Name", 50.0), ("Age", 150.0), ("City", 250.0)],
@@ -1490,6 +1495,87 @@ mod tests {
             }
             other => panic!("expected table, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_ruled_table_survives_single_column_leaf_veto() {
+        let rows = [
+            ("Account", "2024", "2023"),
+            ("Cash", "$1,000", "$900"),
+            ("Debt", "$500", "$600"),
+            ("Equity", "$500", "$300"),
+        ];
+        let mut label_lines = Vec::new();
+        let mut current_value_lines = Vec::new();
+        let mut prior_value_lines = Vec::new();
+        for (row_idx, (label, current, prior)) in rows.iter().enumerate() {
+            let y = 100.0 + row_idx as f32 * 25.0;
+            let mut label_line = line_with_spans(&[(*label, 100.0)], y, 10.0);
+            label_line.region_path = vec![0];
+            label_lines.push(label_line);
+
+            let mut current_value = line_with_spans(&[(*current, 323.0)], y, 8.0);
+            current_value.region_path = vec![1];
+            current_value_lines.push(current_value);
+
+            let mut prior_value = line_with_spans(&[(*prior, 354.0)], y, 8.0);
+            prior_value.region_path = vec![2];
+            prior_value_lines.push(prior_value);
+        }
+        label_lines.extend(current_value_lines);
+        label_lines.extend(prior_value_lines);
+
+        let mut graphics = Vec::new();
+        for y in [90.0, 115.0, 140.0, 165.0, 190.0] {
+            graphics.push(stroke(80.0, y, 380.0, y, 0.5));
+        }
+        for x in [80.0, 320.0, 350.0, 380.0] {
+            graphics.push(stroke(x, 90.0, x, 190.0, 0.5));
+        }
+        let page = page_with_graphics(label_lines, graphics);
+        let rule_segments = super::super::tables::extract_rule_segments(&page.graphics);
+        let label_leaf = &page.projected_lines[..rows.len()];
+        let label_runs = detect_ruled_tables(
+            label_leaf,
+            &rule_segments,
+            page.page_width,
+            page.page_height,
+        );
+        assert!(
+            label_runs
+                .iter()
+                .any(|run| table_column_count(&run.block) == 1),
+            "the label leaf should independently form a single-column ruled run: {label_runs:?}"
+        );
+        assert!(super::super::tables::detect_tables(label_leaf).is_empty());
+
+        let blocks = classify_page(&page, &[]);
+        let table = blocks
+            .iter()
+            .find_map(|block| match &block.block {
+                Block::Table { header, rows } => Some((header, rows)),
+                _ => None,
+            })
+            .expect("the global ruled pass should emit the scattered table");
+
+        let (header, rows) = table;
+        let col_count = header
+            .as_ref()
+            .map(Vec::len)
+            .or_else(|| rows.first().map(Vec::len))
+            .unwrap_or(0);
+        assert!(col_count >= 2, "expected multiple columns, got {table:?}");
+        let cells = header
+            .iter()
+            .flat_map(|cells| cells.iter())
+            .chain(rows.iter().flat_map(|row| row.iter()))
+            .map(|cell| cell.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            cells.contains(&"$1,000"),
+            "missing current value: {cells:?}"
+        );
+        assert!(cells.contains(&"$900"), "missing prior value: {cells:?}");
     }
 
     #[test]
