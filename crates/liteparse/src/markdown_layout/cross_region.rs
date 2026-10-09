@@ -283,7 +283,8 @@ fn fuse_cluster(cluster: &Cluster, path: &[u16]) -> ProjectedLine {
 /// Validation A: the fused zone re-classifies as a table via the standard
 /// detectors, covering most of its lines.
 fn validate_via_detectors(merged: &[ProjectedLine]) -> Option<Vec<TableRun>> {
-    let runs = detect_tables(merged);
+    let mut runs = detect_tables(merged);
+    super::tables::absorb_cross_region_headers(merged, &mut runs);
     let covered: usize = runs
         .iter()
         .filter(|r| match &r.block {
@@ -812,6 +813,153 @@ mod tests {
             has_complete_row,
             "table rows should retain labels and both values"
         );
+    }
+
+    #[test]
+    fn interleaved_table_headers_align_with_merged_body_columns() {
+        let columns = [
+            (
+                50.0,
+                ["Trading", "Projections"],
+                ["Rooms Revenue", "Rooms Occupied", "Average Rate", "RevPAR"],
+            ),
+            (
+                200.0,
+                ["Year One", "Year Two"],
+                ["1,644,143", "1,650,000", "123.45", "87.65"],
+            ),
+            (
+                280.0,
+                ["% of TR", "% of TR"],
+                ["71.0%", "70.5%", "—", "50.2%"],
+            ),
+        ];
+        let mut lines = Vec::new();
+        for (column, (x, top, body)) in columns.iter().enumerate() {
+            for (row, text) in top.iter().enumerate() {
+                lines.push(at_region(
+                    line_with_spans(&[(*text, *x)], 160.0 + row as f32 * 12.0, 10.0),
+                    &[column as u16, 0],
+                ));
+            }
+            if column == 0 {
+                lines.push(at_region(
+                    line_with_spans(&[("Revenue", *x)], 188.0, 10.0),
+                    &[column as u16, 1],
+                ));
+            }
+            for (row, text) in body.iter().enumerate() {
+                lines.push(at_region(
+                    line_with_spans(&[(*text, *x)], 200.0 + row as f32 * 20.0, 10.0),
+                    &[column as u16, 1],
+                ));
+            }
+        }
+
+        let m = find_cross_region_table_merge(&lines).expect("should merge");
+        let header = m
+            .runs
+            .iter()
+            .find_map(|run| match &run.block {
+                Block::Table {
+                    header: Some(header),
+                    ..
+                } => Some(header),
+                _ => None,
+            })
+            .expect("aligned year labels should be absorbed as the table header");
+        let header_text = header
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(header_text.contains("Year One"));
+        assert!(header_text.contains("Year Two"));
+        let body_text = m
+            .runs
+            .iter()
+            .flat_map(|run| match &run.block {
+                Block::Table { rows, .. } => rows
+                    .iter()
+                    .flat_map(|row| row.iter().map(|cell| cell.text.as_str()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body_text.contains("1,644,143"));
+        assert!(body_text.contains("71.0%"));
+    }
+
+    #[test]
+    fn cross_region_header_absorption_skips_one_section_label() {
+        let lines = vec![
+            line_with_spans(&[("Year One", 794.4), ("Total", 875.6)], 100.0, 10.0),
+            line_with_spans(&[("Year Two", 794.4), ("Total", 875.6)], 110.0, 10.0),
+            line_with_spans(&[("Revenue", 50.0)], 120.0, 10.0),
+            line_with_spans(
+                &[("Rooms Revenue", 50.0), ("1,644,143", 794.4)],
+                140.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Rooms Occupied", 50.0), ("1,650,000", 794.4)],
+                160.0,
+                10.0,
+            ),
+        ];
+        let located_cell = |text: &str, x: f32| {
+            Cell::located(
+                text,
+                Rect {
+                    x,
+                    y: 140.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+            )
+        };
+        let mut runs = vec![TableRun {
+            start: 3,
+            end: 5,
+            body_start: 3,
+            bbox: None,
+            block: Block::Table {
+                header: None,
+                rows: vec![
+                    vec![
+                        located_cell("Rooms Revenue", 50.0),
+                        located_cell("1,644,143", 794.4),
+                        Cell::default(),
+                        located_cell("2,000,000", 853.8),
+                    ],
+                    vec![
+                        located_cell("Rooms Occupied", 50.0),
+                        located_cell("1,650,000", 794.4),
+                        Cell::default(),
+                        located_cell("2,100,000", 853.8),
+                    ],
+                ],
+            },
+            interstitials: Vec::new(),
+        }];
+
+        super::super::tables::absorb_cross_region_headers(&lines, &mut runs);
+
+        let run = &runs[0];
+        assert_eq!(run.start, 0);
+        assert_eq!(run.interstitials[0].text, "Revenue");
+        let Block::Table {
+            header: Some(header),
+            ..
+        } = &run.block
+        else {
+            panic!("aligned year labels should become the table header");
+        };
+        assert!(header[1].text.contains("Year One"));
+        assert!(header[1].text.contains("Year Two"));
+        assert!(header[2].text.is_empty());
+        assert!(header[3].text.contains("Total"));
     }
 
     #[test]

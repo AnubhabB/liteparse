@@ -2539,35 +2539,70 @@ fn union_header_from_above(
     lines: &[ProjectedLine],
     body_start: usize,
     floor: usize,
-    tracks: &[f32],
-) -> Option<(usize, Vec<Cell>)> {
+    tracks: &[(f32, f32)],
+    allow_single_interstitial: bool,
+) -> Option<(usize, Vec<Cell>, Vec<Cell>)> {
+    let dbgt = *super::flags::DEBUG_TABLE;
     let tol = TABLE_TRACK_TOLERANCE_PT;
+    if allow_single_interstitial && dbgt {
+        eprintln!(
+            "[tbl-cross-region-header] body tracks=[{}]",
+            tracks
+                .iter()
+                .map(|(start, end)| {
+                    if start.is_finite() && end.is_finite() && start <= end {
+                        format!("{start:.1}..{end:.1}")
+                    } else {
+                        "empty".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let valid_track_centers: Vec<(usize, f32)> = tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (start, end))| {
+            (start.is_finite() && end.is_finite() && start <= end)
+                .then_some((idx, (start + end) * 0.5))
+        })
+        .collect();
     // Fallback assignment for centered header cells whose extent doesn't
-    // reach the track anchor: nearest track within half the local gap.
+    // reach the track anchor: nearest track within half the local gap, with a
+    // small extra margin for cross-region header absorption.
     let assign_nearest = |x_center: f32| -> Option<usize> {
-        let (idx, d) = tracks
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| (i, (x_center - t).abs()))
-            .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        let local_gap = if idx + 1 < tracks.len() {
-            tracks[idx + 1] - tracks[idx]
-        } else if idx > 0 {
-            tracks[idx] - tracks[idx - 1]
+        let (position, &(idx, center)) =
+            valid_track_centers
+                .iter()
+                .enumerate()
+                .min_by(|(_, (_, a)), (_, (_, b))| {
+                    (x_center - *a).abs().total_cmp(&(x_center - *b).abs())
+                })?;
+        let d = (x_center - center).abs();
+        let local_gap = if position + 1 < valid_track_centers.len() {
+            valid_track_centers[position + 1].1 - center
+        } else if position > 0 {
+            center - valid_track_centers[position - 1].1
         } else {
             f32::INFINITY
         };
-        if d <= (local_gap * 0.5).max(TABLE_SUBSET_TRACK_TOLERANCE_PT) {
+        let edge_tolerance = if allow_single_interstitial { tol } else { 0.0 };
+        if d <= (local_gap * 0.5 + edge_tolerance).max(TABLE_SUBSET_TRACK_TOLERANCE_PT) {
             Some(idx)
         } else {
             None
         }
     };
     let mut layers: Vec<Vec<Cell>> = Vec::new();
+    let mut skipped = None;
     let mut j = body_start;
     while j > floor && layers.len() < TABLE_CLUSTER_MAX_HEADER_LINES {
         let cand = j - 1;
         if !table_rows_adjacent(&lines[cand], &lines[j]) {
+            if allow_single_interstitial && dbgt {
+                eprintln!("[tbl-cross-region-header] stop @{cand}: not adjacent to line {j}");
+            }
             break;
         }
         let spans: Vec<&TextItem> = lines[cand]
@@ -2576,6 +2611,18 @@ fn union_header_from_above(
             .filter(|s| !s.text.trim().is_empty())
             .collect();
         if spans.len() < 2 {
+            if allow_single_interstitial
+                && layers.is_empty()
+                && skipped.is_none()
+                && spans.len() == 1
+            {
+                if dbgt {
+                    eprintln!("[tbl-cross-region-header] skip single-cell line @{cand}");
+                }
+                skipped = Some(cand);
+                j = cand;
+                continue;
+            }
             break;
         }
         let mut layer = vec![Cell::default(); tracks.len()];
@@ -2583,10 +2630,25 @@ fn union_header_from_above(
         for s in &spans {
             let x0 = s.x;
             let x1 = s.x + s.width.max(0.0);
+            let header_cell = TableCell {
+                start_x: x0,
+                end_x: x1,
+                text: String::new(),
+                bold: false,
+            };
             let covered: Vec<usize> = tracks
                 .iter()
                 .enumerate()
-                .filter(|&(_, &t)| t >= x0 - tol && t <= x1 + tol)
+                .filter(|&(_, range)| {
+                    if !range.0.is_finite() || !range.1.is_finite() || range.0 > range.1 {
+                        return false;
+                    }
+                    if (range.1 - range.0).abs() <= f32::EPSILON {
+                        range.0 >= x0 - tol && range.0 <= x1 + tol
+                    } else {
+                        cell_aligns_track(&header_cell, *range)
+                    }
+                })
                 .map(|(i, _)| i)
                 .collect();
             let targets: Vec<usize> = if !covered.is_empty() {
@@ -2594,6 +2656,12 @@ fn union_header_from_above(
             } else if let Some(idx) = assign_nearest((x0 + x1) * 0.5) {
                 vec![idx]
             } else {
+                if allow_single_interstitial && dbgt {
+                    eprintln!(
+                        "[tbl-cross-region-header] unassigned @{cand} {:?} x={x0:.1}..{x1:.1}",
+                        s.text.trim()
+                    );
+                }
                 ok = false;
                 break;
             };
@@ -2615,12 +2683,18 @@ fn union_header_from_above(
             }
         }
         if !ok || layer.iter().filter(|t| !t.text.is_empty()).count() < 2 {
+            if allow_single_interstitial && dbgt {
+                eprintln!("[tbl-cross-region-header] stop @{cand}: spans don't align");
+            }
             break;
         }
         layers.push(layer);
         j = cand;
     }
     if layers.is_empty() {
+        if allow_single_interstitial && dbgt {
+            eprintln!("[tbl-cross-region-header] no aligned header layers");
+        }
         return None;
     }
     layers.reverse();
@@ -2647,7 +2721,23 @@ fn union_header_from_above(
     if header.iter().all(|h| h.text.is_empty()) {
         return None;
     }
-    Some((j, header))
+    if skipped.is_some()
+        && header.iter().filter(|cell| !cell.text.is_empty()).count() * 3 < tracks.len()
+    {
+        if dbgt {
+            eprintln!(
+                "[tbl-cross-region-header] reject sparse header: {}/{} columns",
+                header.iter().filter(|cell| !cell.text.is_empty()).count(),
+                tracks.len()
+            );
+        }
+        return None;
+    }
+    let interstitials = skipped
+        .into_iter()
+        .map(|idx| Cell::located(lines[idx].text.trim().to_string(), lines[idx].bbox.clone()))
+        .collect();
+    Some((j, header, interstitials))
 }
 
 /// Re-extract a cluster of adjacent table runs as one table against the
@@ -2766,10 +2856,11 @@ fn build_union_table(
         return None;
     }
 
-    let absorbed = union_header_from_above(lines, window_start, floor, &tracks);
-    let (start, header) = match absorbed {
-        Some((hstart, header)) => (hstart, Some(header)),
-        None => (window_start, None),
+    let track_ranges: Vec<(f32, f32)> = tracks.iter().map(|&track| (track, track)).collect();
+    let absorbed = union_header_from_above(lines, window_start, floor, &track_ranges, false);
+    let (start, header, interstitials) = match absorbed {
+        Some((hstart, header, interstitials)) => (hstart, Some(header), interstitials),
+        None => (window_start, None, Vec::new()),
     };
     Some(TableRun {
         start,
@@ -2779,7 +2870,7 @@ fn build_union_table(
         // starts at the first fragment's body and `union_header_from_above`
         // stops at prose, so any stepped-over line lands outside the new span
         // and is classified normally — preserved as a paragraph, not dropped.
-        interstitials: Vec::new(),
+        interstitials,
         bbox: lines_bbox(lines, start, window_end),
         block: Block::Table { header, rows },
     })
@@ -2795,30 +2886,87 @@ fn run_column_count(run: &TableRun) -> Option<usize> {
     }
 }
 
-/// Re-derive column tracks from the run's source lines. Aggregates min start_x
-/// and max end_x across *every* line whose `split_cells` count matches the
-/// run's declared column count, so a column with tight per-row content (e.g.
-/// a right-aligned numeric body cell) still produces a track wide enough to
-/// match a wider header cell that aligns to the same column.
+/// Re-derive column tracks from located body cells when available, falling
+/// back to source lines. Aggregates min start_x and max end_x across every
+/// matching row, so a column with tight per-row content still produces a
+/// track wide enough to match a wider header cell.
 fn run_body_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, f32)>> {
     let n_cols = run_column_count(run)?;
-    let mut acc: Option<Vec<(f32, f32)>> = None;
-    for line in &lines[run.start..run.end.min(lines.len())] {
+    let mut acc = vec![None; n_cols];
+    if let Block::Table { rows, .. } = &run.block {
+        for row in rows.iter().filter(|row| row.len() == n_cols) {
+            for (idx, cell) in row.iter().enumerate() {
+                if cell.text.trim().is_empty() {
+                    continue;
+                }
+                let Some(bbox) = &cell.bbox else {
+                    continue;
+                };
+                let range = (bbox.x, bbox.x + bbox.width);
+                acc[idx] = Some(
+                    acc[idx].map_or(range, |(s, e): (f32, f32)| (s.min(range.0), e.max(range.1))),
+                );
+            }
+        }
+    }
+    for line in &lines[run.body_start..run.end.min(lines.len())] {
         let cells = split_cells(line);
         if cells.len() != n_cols {
             continue;
         }
-        let row: Vec<(f32, f32)> = cells.iter().map(|c| (c.start_x, c.end_x)).collect();
-        acc = Some(match acc {
-            None => row,
-            Some(prev) => prev
-                .into_iter()
-                .zip(row)
-                .map(|((ps, pe), (s, e))| (ps.min(s), pe.max(e)))
-                .collect(),
-        });
+        for (idx, cell) in cells.iter().enumerate() {
+            let range = (cell.start_x, cell.end_x);
+            acc[idx] =
+                Some(acc[idx].map_or(range, |(s, e): (f32, f32)| (s.min(range.0), e.max(range.1))));
+        }
     }
-    acc
+    if !acc.iter().any(Option::is_some) {
+        return None;
+    }
+    Some(
+        acc.into_iter()
+            .map(|range| range.unwrap_or((f32::INFINITY, f32::NEG_INFINITY)))
+            .collect(),
+    )
+}
+
+pub(super) fn absorb_cross_region_headers(lines: &[ProjectedLine], runs: &mut [TableRun]) {
+    let dbgt = *super::flags::DEBUG_TABLE;
+    let mut floor = 0;
+    for run in runs {
+        let needs_header = matches!(
+            &run.block,
+            Block::Table {
+                header: None,
+                rows
+            } if !rows.is_empty()
+        );
+        if needs_header && let Some(body_tracks) = run_body_tracks(run, lines) {
+            if let Some((start, header, interstitials)) =
+                union_header_from_above(lines, run.body_start, floor, &body_tracks, true)
+            {
+                if dbgt {
+                    eprintln!(
+                        "[tbl-cross-region-header] absorbed lines {start}..{} into {} columns",
+                        run.body_start,
+                        header.len()
+                    );
+                }
+                run.start = start;
+                run.bbox = lines_bbox(lines, start, run.end);
+                run.interstitials = interstitials;
+                if let Block::Table {
+                    header: run_header, ..
+                } = &mut run.block
+                {
+                    *run_header = Some(header);
+                }
+            }
+        } else if needs_header && dbgt {
+            eprintln!("[tbl-cross-region-header] skip run: no body tracks");
+        }
+        floor = run.end;
+    }
 }
 
 fn tracks_align_same(a: &[(f32, f32)], b: &[(f32, f32)]) -> bool {
