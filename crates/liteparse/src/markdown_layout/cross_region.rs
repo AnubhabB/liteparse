@@ -508,6 +508,16 @@ pub(super) fn find_cross_region_table_merge(lines: &[ProjectedLine]) -> Option<C
             // stacked leaves on the other side; the extension below pulls the
             // rest in, so the band must cover both sides fully.
             let band = (left.y0.min(right.y0) - 2.0, left.y1.max(right.y1) + 2.0);
+            let stays_on_one_side = |leaf: &Leaf| {
+                let width = (leaf.x1 - leaf.x0).max(1.0);
+                let center = (leaf.x0 + leaf.x1) * 0.5;
+                let overhang = if center < cut_x {
+                    (leaf.x1 - cut_x).max(0.0)
+                } else {
+                    (cut_x - leaf.x0).max(0.0)
+                };
+                overhang <= CR_SIBLING_MAX_X_OVERLAP_FRAC * width
+            };
 
             // Extend the pair to every leaf living inside the overlap band and
             // entirely on one side of the cut (a side may itself be H-cut into
@@ -522,14 +532,7 @@ pub(super) fn find_cross_region_table_merge(lines: &[ProjectedLine]) -> Option<C
                 // The leaf must sit predominantly on one side of the cut:
                 // its overhang across the cut stays within the straddle
                 // allowance (widened slices), measured against its own width.
-                let width = (leaf.x1 - leaf.x0).max(1.0);
-                let center = (leaf.x0 + leaf.x1) * 0.5;
-                let overhang = if center < cut_x {
-                    (leaf.x1 - cut_x).max(0.0)
-                } else {
-                    (cut_x - leaf.x0).max(0.0)
-                };
-                if overhang <= CR_SIBLING_MAX_X_OVERLAP_FRAC * width {
+                if stays_on_one_side(leaf) {
                     set_leaves.push(k);
                 }
             }
@@ -537,11 +540,46 @@ pub(super) fn find_cross_region_table_merge(lines: &[ProjectedLine]) -> Option<C
                 continue;
             }
 
-            // The set's line ranges must tile a contiguous range — a foreign
-            // leaf interleaved in reading order means this isn't a clean
-            // sliced zone.
-            let lo = set_leaves.iter().map(|&k| leaves[k].start).min().unwrap();
-            let hi = set_leaves.iter().map(|&k| leaves[k].end).max().unwrap();
+            // Close over interleaved leaves inside the selected line range.
+            // Do not extend the y-band here: only the original candidate set
+            // uses that test, while closure admits intervening leaves that
+            // remain predominantly on one side of the same cut.
+            let mut lo = set_leaves.iter().map(|&k| leaves[k].start).min().unwrap();
+            let mut hi = set_leaves.iter().map(|&k| leaves[k].end).max().unwrap();
+            loop {
+                let covered: usize = set_leaves
+                    .iter()
+                    .map(|&k| leaves[k].end - leaves[k].start)
+                    .sum();
+                if covered == hi - lo {
+                    break;
+                }
+                let additions: Vec<usize> = leaves
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, leaf)| {
+                        !set_leaves.contains(k)
+                            && leaf.start >= lo
+                            && leaf.end <= hi
+                            && stays_on_one_side(leaf)
+                    })
+                    .map(|(k, _)| k)
+                    .collect();
+                if additions.is_empty() {
+                    break;
+                }
+                if debug {
+                    for &k in &additions {
+                        eprintln!(
+                            "[cross-region] close cut@{cut_x:.1}: add leaf {k} lines [{},{})",
+                            leaves[k].start, leaves[k].end
+                        );
+                    }
+                }
+                set_leaves.extend(additions);
+                lo = set_leaves.iter().map(|&k| leaves[k].start).min().unwrap();
+                hi = set_leaves.iter().map(|&k| leaves[k].end).max().unwrap();
+            }
             let covered: usize = set_leaves
                 .iter()
                 .map(|&k| leaves[k].end - leaves[k].start)
@@ -709,6 +747,77 @@ mod tests {
         assert!(m.merged[0].text.contains("MANILA"));
         assert!(m.merged[0].text.contains("2454"));
         assert!(m.merged[0].text.contains("6125"));
+    }
+
+    fn interleaved_three_column_table(wide_top_prose: bool) -> Vec<ProjectedLine> {
+        let columns = [
+            (
+                50.0,
+                ["Trading", "Projections"],
+                ["Rooms Revenue", "Rooms Occupied", "Average Rate", "RevPAR"],
+            ),
+            (
+                200.0,
+                ["Year One", "Year Two"],
+                ["1,644,143", "1,650,000", "123.45", "87.65"],
+            ),
+            (
+                280.0,
+                ["% of TR", "% of TR"],
+                ["71.0%", "70.5%", "—", "50.2%"],
+            ),
+        ];
+        let mut lines = Vec::new();
+        for (column, (x, top, body)) in columns.iter().enumerate() {
+            for (row, text) in top.iter().enumerate() {
+                let line = if wide_top_prose && column == 2 && row == 0 {
+                    line(&"a ".repeat(80), -200.0, 100.0, 10.0, 10.0)
+                } else {
+                    line_with_spans(&[(text, *x)], 100.0 + row as f32 * 12.0, 10.0)
+                };
+                lines.push(at_region(line, &[column as u16, 0]));
+            }
+            for (row, text) in body.iter().enumerate() {
+                lines.push(at_region(
+                    line_with_spans(&[(text, *x)], 200.0 + row as f32 * 20.0, 10.0),
+                    &[column as u16, 1],
+                ));
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn interleaved_h_cut_leaves_close_into_a_table() {
+        let lines = interleaved_three_column_table(false);
+        let m =
+            find_cross_region_table_merge(&lines).expect("should close over interleaved leaves");
+        assert_eq!(m.merged.len(), 6);
+        assert!(m.merged[2].text.contains("Rooms Revenue"));
+        assert!(m.merged[2].text.contains("1,644,143"));
+        assert!(m.merged[2].text.contains("71.0%"));
+        let has_complete_row = m.runs.iter().any(|run| match &run.block {
+            Block::Table { header, rows } => header.iter().chain(rows.iter()).any(|row| {
+                let text = row
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>();
+                text.contains("Rooms Revenue")
+                    && text.contains("1,644,143")
+                    && text.contains("71.0%")
+            }),
+            _ => false,
+        });
+        assert!(
+            has_complete_row,
+            "table rows should retain labels and both values"
+        );
+    }
+
+    #[test]
+    fn interleaved_wide_prose_leaf_prevents_closure() {
+        let lines = interleaved_three_column_table(true);
+        assert!(find_cross_region_table_merge(&lines).is_none());
     }
 
     /// Two side-by-side prose columns with coincidentally aligned baselines
