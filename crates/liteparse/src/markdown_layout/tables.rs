@@ -3807,17 +3807,6 @@ impl CellGrid {
     }
 }
 
-/// Bin each line's text into the grid cells defined by column boundaries `xs`
-/// and row boundaries `ys`. A projected line frequently spans several ruled
-/// columns (one baseline = one line), so binning whole lines by centroid would
-/// lump an entire row into one cell and leave the rest empty — the empty-cell
-/// filter would then reject the real table. Instead bin each line's raw spans
-/// by span center; spans whose x-extent crosses one or more interior column
-/// boundaries are split at the whitespace nearest each crossed boundary (same
-/// interpolation as the inferred-track path). Returns the filled grid and the
-/// consumed line indices, or `None` if no line landed inside the grid or too
-/// many spans straddle interior boundaries (a decorative box over prose, not a
-/// table).
 #[derive(Clone, Copy)]
 struct ProseBoundaryCrossing {
     crossed: bool,
@@ -4031,6 +4020,17 @@ fn should_stop_at_running_prose(
     stop
 }
 
+/// Bin each line's text into the grid cells defined by column boundaries `xs`
+/// and row boundaries `ys`. A projected line frequently spans several ruled
+/// columns (one baseline = one line), so binning whole lines by centroid would
+/// lump an entire row into one cell and leave the rest empty — the empty-cell
+/// filter would then reject the real table. Instead bin each line's raw spans
+/// by span center; spans whose x-extent crosses one or more interior column
+/// boundaries are split at the whitespace nearest each crossed boundary (same
+/// interpolation as the inferred-track path). Returns the filled grid and the
+/// consumed line indices, or `None` if no line landed inside the grid or too
+/// many spans straddle interior boundaries (a decorative box over prose, not a
+/// table).
 fn assign_cells(
     lines: &[ProjectedLine],
     xs: &[f32],
