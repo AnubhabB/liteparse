@@ -3818,10 +3818,224 @@ impl CellGrid {
 /// consumed line indices, or `None` if no line landed inside the grid or too
 /// many spans straddle interior boundaries (a decorative box over prose, not a
 /// table).
+#[derive(Clone, Copy)]
+struct ProseBoundaryCrossing {
+    crossed: bool,
+    via: &'static str,
+    gap_width: Option<f32>,
+}
+
+type ProseXRange = (f32, f32);
+
+fn running_prose_sentence_shape(line: &ProjectedLine) -> bool {
+    let text = line.text.trim();
+    let char_count = text.chars().count();
+    let word_count = text.split_whitespace().count();
+    let non_space_count = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    let alpha_count = text.chars().filter(|ch| ch.is_alphabetic()).count();
+    char_count >= 90
+        && word_count >= 12
+        && non_space_count > 0
+        && alpha_count as f32 >= non_space_count as f32 * 0.6
+        && text.chars().any(|ch| matches!(ch, '.' | '!' | '?'))
+}
+
+fn prose_line_x_ranges(line: &ProjectedLine) -> (Vec<ProseXRange>, Vec<ProseXRange>) {
+    let mut words = Vec::new();
+    let mut item_only = Vec::new();
+    for span in line
+        .spans
+        .iter()
+        .filter(|span| !span.text.trim().is_empty())
+    {
+        if let Some(span_words) = verified_words(span) {
+            words.extend(span_words.into_iter().filter_map(|word| {
+                let x1 = word.x + word.width;
+                (word.width > 0.0 && x1.is_finite()).then_some((word.x, x1))
+            }));
+        } else if span.width > 0.0 {
+            item_only.push((span.x, span.x + span.width));
+        }
+    }
+    words.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (words, item_only)
+}
+
+fn prose_boundary_crossing(
+    boundary: f32,
+    word_ranges: &[ProseXRange],
+    item_only_ranges: &[ProseXRange],
+    gap_limit: f32,
+) -> ProseBoundaryCrossing {
+    const EDGE_MARGIN_PT: f32 = 1.5;
+    if word_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary >= x0 + EDGE_MARGIN_PT && boundary <= x1 - EDGE_MARGIN_PT)
+    {
+        return ProseBoundaryCrossing {
+            crossed: true,
+            via: "word-box",
+            gap_width: None,
+        };
+    }
+    for pair in word_ranges.windows(2) {
+        let gap_width = pair[1].0 - pair[0].1;
+        if gap_width >= 0.0 && boundary >= pair[0].1 && boundary <= pair[1].0 {
+            return ProseBoundaryCrossing {
+                crossed: gap_width < gap_limit,
+                via: if gap_width < gap_limit {
+                    "inter-word-gap"
+                } else {
+                    "wide-gap"
+                },
+                gap_width: Some(gap_width),
+            };
+        }
+    }
+    if word_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary > x0 && boundary < x1)
+    {
+        return ProseBoundaryCrossing {
+            crossed: false,
+            via: "word-edge-margin",
+            gap_width: None,
+        };
+    }
+    if item_only_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary >= x0 + EDGE_MARGIN_PT && boundary <= x1 - EDGE_MARGIN_PT)
+    {
+        return ProseBoundaryCrossing {
+            crossed: true,
+            via: "item-box",
+            gap_width: None,
+        };
+    }
+    if item_only_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary > x0 && boundary < x1)
+    {
+        return ProseBoundaryCrossing {
+            crossed: false,
+            via: "item-edge-margin",
+            gap_width: None,
+        };
+    }
+    ProseBoundaryCrossing {
+        crossed: false,
+        via: "none",
+        gap_width: None,
+    }
+}
+
+fn prose_line_font_height(line: &ProjectedLine) -> f32 {
+    let mut heights: Vec<f32> = line
+        .spans
+        .iter()
+        .filter_map(|span| span.font_height.or(span.font_size))
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .collect();
+    heights.sort_by(f32::total_cmp);
+    heights
+        .get(heights.len() / 2)
+        .copied()
+        .or_else(|| {
+            (line.dominant_font_size.is_finite() && line.dominant_font_size > 0.0)
+                .then_some(line.dominant_font_size)
+        })
+        .unwrap_or_else(|| line.bbox.height.max(1.0))
+}
+
+fn should_stop_at_running_prose(
+    line: &ProjectedLine,
+    xs: &[f32],
+    row: usize,
+    idx: usize,
+    dbg: bool,
+) -> bool {
+    if !running_prose_sentence_shape(line) {
+        return false;
+    }
+    let boundaries: Vec<f32> = xs
+        .iter()
+        .copied()
+        .skip(1)
+        .take(xs.len().saturating_sub(2))
+        .collect();
+    let (word_ranges, item_only_ranges) = prose_line_x_ranges(line);
+    let geometry = match (word_ranges.is_empty(), item_only_ranges.is_empty()) {
+        (false, false) => "verified-word-boxes with item-box fallback",
+        (false, true) => "verified-word-boxes",
+        (true, false) => "item-level boxes (no verified word boxes)",
+        (true, true) => "no word or item boxes",
+    };
+    let line_x0 = line.bbox.x;
+    let line_x1 = line.bbox.x + line.bbox.width;
+    let font_height = prose_line_font_height(line);
+    let gap_limit = font_height * 0.5;
+    if boundaries.is_empty() {
+        if dbg {
+            eprintln!(
+                "[ruled] prose candidate line idx={idx} row={row} x={line_x0:.1}..{line_x1:.1} geometry={geometry}: no interior column boundaries; skip stop"
+            );
+        }
+        return false;
+    }
+    if dbg {
+        eprintln!(
+            "[ruled] prose candidate line idx={idx} row={row} x={line_x0:.1}..{line_x1:.1} font-height={font_height:.1} geometry={geometry} interior-boundaries={}",
+            boundaries.len()
+        );
+    }
+    let mut in_extent = 0usize;
+    let mut crossed = 0usize;
+    for boundary in boundaries {
+        let within_line = boundary >= line_x0 && boundary <= line_x1;
+        let decision = if within_line {
+            in_extent += 1;
+            prose_boundary_crossing(boundary, &word_ranges, &item_only_ranges, gap_limit)
+        } else {
+            ProseBoundaryCrossing {
+                crossed: false,
+                via: "outside-line",
+                gap_width: None,
+            }
+        };
+        if decision.crossed {
+            crossed += 1;
+        }
+        if dbg {
+            let gap_width = decision
+                .gap_width
+                .map_or_else(|| "n/a".to_string(), |gap| format!("{gap:.1}"));
+            eprintln!(
+                "[ruled] prose boundary idx={idx} x={boundary:.1} in_extent={} crossed={} via={} gap_width={gap_width} gap_limit={gap_limit:.1}",
+                if within_line { "yes" } else { "no" },
+                if decision.crossed { "yes" } else { "no" },
+                decision.via
+            );
+        }
+    }
+    let ratio = if in_extent == 0 {
+        0.0
+    } else {
+        crossed as f32 / in_extent as f32
+    };
+    let stop = in_extent >= 2 && crossed >= 2 && ratio >= 0.67;
+    if dbg {
+        eprintln!(
+            "[ruled] prose boundary decision idx={idx} crossed={crossed} in_extent={in_extent} ratio={ratio:.2} stop={stop}"
+        );
+    }
+    stop
+}
+
 fn assign_cells(
     lines: &[ProjectedLine],
     xs: &[f32],
     ys: &[f32],
+    stop_at_running_prose: bool,
     dbg: bool,
 ) -> Option<(CellGrid, Vec<usize>)> {
     let n_rows = ys.len() - 1;
@@ -3860,6 +4074,15 @@ fn assign_cells(
         };
         if line.text.trim().is_empty() {
             continue;
+        }
+        if stop_at_running_prose && should_stop_at_running_prose(line, xs, row, idx, dbg) {
+            if dbg {
+                eprintln!(
+                    "[ruled] stop at running prose line idx={idx} row={row}: {:?}",
+                    line.text.chars().take(120).collect::<String>()
+                );
+            }
+            break;
         }
 
         // Only consume the line when its text sits inside the grid
@@ -4674,7 +4897,8 @@ fn build_ruled_table_from(
     // Assign text to cells, then reject if no lines landed inside the grid or
     // too many spans straddle interior column boundaries (decorative box, not
     // a table).
-    let (mut grid, consumed_indices) = assign_cells(lines, &xs, &ys, dbg)?;
+    let (mut grid, consumed_indices) =
+        assign_cells(lines, &xs, &ys, pass == RuledPass::Global, dbg)?;
     let straddle_frac = grid.straddle_frac;
     grid.spanned = rowspan_mask(hs, h_indices, vs, v_kept, &xs, &ys);
 
@@ -5329,6 +5553,157 @@ pub(super) fn escape_table_cell(s: &str) -> String {
 mod tests {
     use super::super::test_helpers::{line, line_with_spans, rect_borders, stroke};
     use super::*;
+
+    fn prose_test_words<'a>(
+        words: &'a [&'a str],
+        start_x: f32,
+        char_width: f32,
+        word_gap: f32,
+    ) -> Vec<(&'a str, f32, f32)> {
+        let mut x = start_x;
+        words
+            .iter()
+            .map(|word| {
+                let width = word.chars().count() as f32 * char_width;
+                let positioned = (*word, x, width);
+                x += width + word_gap;
+                positioned
+            })
+            .collect()
+    }
+
+    fn prose_test_span(words: &[(&str, f32, f32)], font_size: f32) -> crate::types::TextItem {
+        let x = words[0].1;
+        let end_x = words.last().map(|(_, x, width)| x + width).unwrap_or(x);
+        crate::types::TextItem {
+            text: words
+                .iter()
+                .map(|(word, _, _)| *word)
+                .collect::<Vec<_>>()
+                .join(" "),
+            x,
+            y: 0.0,
+            width: end_x - x,
+            height: font_size,
+            font_size: Some(font_size),
+            words: words
+                .iter()
+                .map(|(text, x, width)| crate::types::WordBox {
+                    text: (*text).into(),
+                    x: *x,
+                    y: 0.0,
+                    width: *width,
+                    height: font_size,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn prose_test_line(
+        text: &str,
+        spans: Vec<crate::types::TextItem>,
+        font_size: f32,
+    ) -> ProjectedLine {
+        let x0 = spans
+            .iter()
+            .map(|span| span.x)
+            .fold(f32::INFINITY, f32::min);
+        let x1 = spans
+            .iter()
+            .map(|span| span.x + span.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut line = line(text, x0, 0.0, font_size, font_size);
+        line.bbox = crate::types::Rect {
+            x: x0,
+            y: 0.0,
+            width: x1 - x0,
+            height: font_size,
+        };
+        line.spans = spans;
+        line
+    }
+
+    #[test]
+    fn justified_prose_crossing_three_ruled_columns_stops() {
+        let text = "During the year ended September 30, 2025, compensation expense increased $1.3 billion, or 2.8%, compared";
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let positions = prose_test_words(&words, 10.0, 3.0, 2.0);
+        let line = prose_test_line(text, vec![prose_test_span(&positions, 10.0)], 10.0);
+        let first_gap = positions[5].1 + positions[5].2 + 1.0;
+        let second_gap = positions[10].1 + positions[10].2 + 1.0;
+        let xs = [0.0, first_gap, second_gap, 330.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        assert!(should_stop_at_running_prose(&line, &xs, 0, 25, false));
+    }
+
+    #[test]
+    fn first_rent_comps_row_with_wide_cell_gaps_continues() {
+        let left_words = ["1", "Ashley", "Gables", "Buckhead", "530", "E", "Paces"];
+        let middle_words = ["Ferry", "Rd", "NE", "2019", "Residential"];
+        let right_words = ["94%", "325", "0.6", "Miles", "$2,443"];
+        let left_positions = prose_test_words(&left_words, 10.0, 2.0, 2.0);
+        let middle_positions = prose_test_words(&middle_words, 120.0, 2.0, 2.0);
+        let right_positions = prose_test_words(&right_words, 220.0, 2.0, 2.0);
+        let text = "1 Ashley Gables Buckhead 530 E Paces Ferry Rd NE 2019 Residential 94% 325 0.6 Miles $2,443";
+        let line = prose_test_line(
+            text,
+            vec![
+                prose_test_span(&left_positions, 10.0),
+                prose_test_span(&middle_positions, 10.0),
+                prose_test_span(&right_positions, 10.0),
+            ],
+            10.0,
+        );
+        let xs = [0.0, 100.0, 200.0, 300.0];
+        let ys = [0.0, 20.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        let (_, consumed) = assign_cells(&[line], &xs, &ys, true, false).unwrap();
+        assert_eq!(
+            consumed,
+            [0],
+            "the first data row has no prior assigned cells"
+        );
+    }
+
+    #[test]
+    fn long_left_column_label_with_right_column_numbers_continues() {
+        let label = "The subject property benefits from recent renovations and convenient access to neighborhood services.";
+        let text = format!("{label} $1,250 2025");
+        let spans = vec![
+            crate::types::TextItem {
+                text: label.into(),
+                x: 10.0,
+                y: 0.0,
+                width: 270.0,
+                height: 10.0,
+                ..Default::default()
+            },
+            crate::types::TextItem {
+                text: "$1,250".into(),
+                x: 330.0,
+                y: 0.0,
+                width: 30.0,
+                height: 10.0,
+                ..Default::default()
+            },
+            crate::types::TextItem {
+                text: "2025".into(),
+                x: 520.0,
+                y: 0.0,
+                width: 24.0,
+                height: 10.0,
+                ..Default::default()
+            },
+        ];
+        let line = prose_test_line(&text, spans, 10.0);
+        let xs = [0.0, 300.0, 500.0, 680.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        assert!(!should_stop_at_running_prose(&line, &xs, 0, 0, false));
+    }
 
     /// One PDFium run whose words sit at the given (x, width) positions.
     fn run_with_words(words: &[(&str, f32, f32)]) -> TextItem {
