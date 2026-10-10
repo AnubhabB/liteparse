@@ -2418,26 +2418,20 @@ fn cluster_adjacent(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> bool
         // check, failed-row fraction) still gate the actual merge.
         return true;
     };
-    let (narrow, wide) = if a_tracks.len() <= b_tracks.len() {
-        (&a_tracks, &b_tracks)
-    } else {
-        (&b_tracks, &a_tracks)
-    };
-    let matched = narrow
-        .iter()
-        .filter(|&&t| {
-            wide.iter()
-                .any(|&w| subset_match_score(t, w, TABLE_SUBSET_TRACK_TOLERANCE_PT).is_some())
-        })
-        .count();
-    let ok = (matched as f32) >= (narrow.len() as f32) * 0.75;
+    let (matched, total) = matching_track_count(&a_tracks, &b_tracks);
+    let ok = (matched as f32) >= (total as f32) * 0.75;
     if !ok && dbgt {
+        let (narrow, wide) = if a_tracks.len() <= b_tracks.len() {
+            (&a_tracks, &b_tracks)
+        } else {
+            (&b_tracks, &a_tracks)
+        };
         eprintln!(
             "[tbl-cluster] adjacency reject @{}..{}: tracks {}/{} matched (narrow=[{}] wide=[{}])",
             a.start,
             b.end,
             matched,
-            narrow.len(),
+            total,
             narrow
                 .iter()
                 .map(|t| format!("{:.0}-{:.0}", t.0, t.1))
@@ -2886,11 +2880,31 @@ fn run_column_count(run: &TableRun) -> Option<usize> {
     }
 }
 
-/// Re-derive column tracks from located body cells when available, falling
-/// back to source lines. Aggregates min start_x and max end_x across every
-/// matching row, so a column with tight per-row content still produces a
-/// track wide enough to match a wider header cell.
+/// Re-derive column tracks from source lines for adjacency and table merging.
 fn run_body_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, f32)>> {
+    let n_cols = run_column_count(run)?;
+    let mut acc: Option<Vec<(f32, f32)>> = None;
+    for line in &lines[run.start..run.end.min(lines.len())] {
+        let cells = split_cells(line);
+        if cells.len() != n_cols {
+            continue;
+        }
+        let row: Vec<(f32, f32)> = cells.iter().map(|c| (c.start_x, c.end_x)).collect();
+        acc = Some(match acc {
+            None => row,
+            Some(prev) => prev
+                .into_iter()
+                .zip(row)
+                .map(|((ps, pe), (s, e))| (ps.min(s), pe.max(e)))
+                .collect(),
+        });
+    }
+    acc
+}
+
+/// Re-derive cross-region header tracks from located body cells where possible,
+/// falling back to source lines.
+fn cross_region_header_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, f32)>> {
     let n_cols = run_column_count(run)?;
     let mut acc = vec![None; n_cols];
     if let Block::Table { rows, .. } = &run.block {
@@ -2930,6 +2944,19 @@ fn run_body_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, 
     )
 }
 
+pub(super) fn matching_track_count(a: &[(f32, f32)], b: &[(f32, f32)]) -> (usize, usize) {
+    let (narrow, wide) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let matched = narrow
+        .iter()
+        .filter(|&&track| {
+            wide.iter().any(|&other| {
+                subset_match_score(track, other, TABLE_SUBSET_TRACK_TOLERANCE_PT).is_some()
+            })
+        })
+        .count();
+    (matched, narrow.len())
+}
+
 pub(super) fn absorb_cross_region_headers(lines: &[ProjectedLine], runs: &mut [TableRun]) {
     let dbgt = *super::flags::DEBUG_TABLE;
     let mut floor = 0;
@@ -2941,7 +2968,7 @@ pub(super) fn absorb_cross_region_headers(lines: &[ProjectedLine], runs: &mut [T
                 rows
             } if !rows.is_empty()
         );
-        if needs_header && let Some(body_tracks) = run_body_tracks(run, lines) {
+        if needs_header && let Some(body_tracks) = cross_region_header_tracks(run, lines) {
             if let Some((start, header, interstitials)) =
                 union_header_from_above(lines, run.body_start, floor, &body_tracks, true)
             {
