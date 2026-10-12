@@ -2033,7 +2033,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "liteparse"
-version = "2.15.1"
+version = "2.16.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "liteparse-napi"
-version = "2.15.1"
+version = "2.16.0"
 dependencies = [
  "image",
  "liteparse",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "liteparse-pdfium"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "blake3",
  "liteparse-pdfium-sys",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "liteparse-pdfium-sys"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "bindgen",
  "flate2",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "liteparse-python"
-version = "2.15.1"
+version = "2.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "liteparse-wasm"
-version = "2.15.1"
+version = "2.16.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
