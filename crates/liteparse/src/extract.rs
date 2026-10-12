@@ -1443,6 +1443,19 @@ fn rectf_to_rect(r: &RectF) -> Rect {
     }
 }
 
+/// Unicode combining diacritical marks, which PDFs often draw as their own
+/// glyph back over the base letter.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
 /// Fold typographic punctuation to its ASCII equivalent so extracted text
 /// matches plain-ASCII transcriptions: curly quotes → `'`/`"`, the dash family
 /// (en/em/figure/non-breaking/minus) → `-`. Applied to every decoded character
@@ -1691,15 +1704,23 @@ fn extract_page_text_items(
             let strict_below = vp_strict.top > seg.last_char_bottom;
             let large_backward_jump = gap < -5.0;
             let seg_width = seg.vp_right - seg.vp_left;
-            let em = if seg.font_size > 0.0 {
-                seg.font_size
+            // `font_size` is the raw `Tf` operand, which is 1 when the size
+            // lives in `Tm`/CTM (common in TeX output), and glyph advances are
+            // scaled by it. Take the larger of that and what the run measures on
+            // the page so the cutoff is always in page units. Half an em floors
+            // a run of narrow glyphs (".", "i") so a sub-glyph overlap (or a
+            // ligature reporting both letters at one origin) is not a split.
+            let vp_height = (seg.vp_bottom - seg.vp_top).abs();
+            let em = seg.font_size.max(vp_height);
+            let vp_char_w = if seg.char_count > 0 {
+                seg_width / seg.char_count as f32
             } else {
-                (seg.vp_bottom - seg.vp_top).abs()
+                0.0
             };
-            // `avg_char_width` is the measured advance. Half an em floors a run
-            // of narrow glyphs (".", "i") so a sub-glyph overlap is not a split.
-            let char_w = seg.avg_char_width().max(em * 0.5);
-            let backward_jump = char_w > 0.0 && gap < -(char_w * 3.0);
+            let char_w = seg.avg_char_width().max(vp_char_w).max(em * 0.5);
+            // Combining marks (a separately drawn acute over an earlier "e")
+            // jump back by design; leave them to the run they were drawn in.
+            let backward_jump = char_w > 0.0 && gap < -(char_w * 3.0) && !is_combining_mark(c);
             let very_large_backward_jump =
                 (seg_width > 20.0 && gap < -(seg_width * 0.5)) || backward_jump;
             let line_changed = vp_strict.top > seg.last_char_bottom + y_tolerance
@@ -3782,6 +3803,27 @@ mod tests {
             items.iter().map(|it| it.text.as_str()).collect::<Vec<_>>()
         );
         assert_eq!(items[0].text, "AVATAR");
+    }
+
+    /// TeX-style output sets `1 Tf` and puts the real size in `Tm`, so the
+    /// `Tf` operand is 1 and glyph advances come back at 1pt scale. The
+    /// backward-jump cutoff must still be measured in page units, or ordinary
+    /// kerning (and ligatures like "fi") would split words apart.
+    #[test]
+    fn tm_scaled_kerning_stays_one_item() {
+        let content = "BT /F1 1 Tf 12 0 0 12 72 700 Tm [(A) 250 (VATAR)] TJ ET";
+        let pages = extract_pages_from_input(
+            &PdfInput::Bytes(type1_page_pdf("Helvetica", content)),
+            None,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+        let items = &pages[0].text_items;
+        assert_eq!(
+            items.iter().map(|it| it.text.as_str()).collect::<Vec<_>>(),
+            vec!["AVATAR"]
+        );
     }
 
     #[test]
