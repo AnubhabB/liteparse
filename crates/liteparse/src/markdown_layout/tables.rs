@@ -1119,9 +1119,16 @@ fn try_detect_table_inferred(
     let mut rows: Vec<(usize, &ProjectedLine, Vec<TableCell>)> =
         vec![(body_start, &lines[body_start], first)];
 
+    // See `try_detect_table`: stepped-over lines go back as interstitials.
+    let mut stepped_over: Vec<(usize, bool, Cell)> = Vec::new();
     let mut j = body_start + 1;
     while j < lines.len() {
         if lines[j].bbox.x > tracks_right_edge {
+            stepped_over.push((
+                j,
+                true,
+                Cell::located(lines[j].text.trim(), lines[j].bbox.clone()),
+            ));
             j += 1;
             continue;
         }
@@ -1167,10 +1174,10 @@ fn try_detect_table_inferred(
         // Defer to the existing path, which can fall back to GridFallback.
         bail!("row spacing cv {cv:.2} > {TABLE_ROW_SPACING_MAX_CV}");
     }
-    let end = j;
+    let end = trim_stepped_over_tail(j, body_start, &mut stepped_over);
 
     let bold_eligible = rows[0].2.iter().all(|c| c.bold && !c.text.is_empty());
-    let run = finalize_table_run(
+    let mut run = finalize_table_run(
         lines,
         body_start,
         floor,
@@ -1186,6 +1193,8 @@ fn try_detect_table_inferred(
     if allow_two_row && rows.len() < TABLE_MIN_ROWS && !two_row_run_plausible(lines, &run) {
         bail!("two-row run failed plausibility gates");
     }
+    run.interstitials
+        .extend(stepped_over.into_iter().map(|(_, _, cell)| cell));
     Some(run)
 }
 
@@ -1265,6 +1274,10 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         .fold(f32::NEG_INFINITY, f32::max);
     let tracks_right_edge = track_max_x + TABLE_TRACK_TOLERANCE_PT.max(8.0);
 
+    // Lines and cells the run steps over. They sit inside `start..end`, which
+    // the classifier skips, so they're handed back as interstitials rather
+    // than dropped; `true` marks a whole stepped-over line.
+    let mut stepped_over: Vec<(usize, bool, Cell)> = Vec::new();
     let mut j = start_idx + 1;
     while j < lines.len() {
         // Skip lines that sit entirely to the right of the table's column
@@ -1272,6 +1285,11 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         // Use the line's leftmost span x; if it's past the table's right edge
         // we won't break the run, just step over.
         if lines[j].bbox.x > tracks_right_edge {
+            stepped_over.push((
+                j,
+                true,
+                Cell::located(lines[j].text.trim(), lines[j].bbox.clone()),
+            ));
             j += 1;
             continue;
         }
@@ -1383,6 +1401,12 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
                 .filter(|c| match_track_idx(c, &track_ranges).is_none())
                 .all(|c| c.end_x < first_track_x || c.start_x > tracks_right_edge);
             if kept.len() == column_count && extras_all_outside {
+                for c in cells
+                    .iter()
+                    .filter(|c| match_track_idx(c, &track_ranges).is_none())
+                {
+                    stepped_over.push((j, false, located_cell(c, &lines[j])));
+                }
                 cells = kept;
             } else {
                 break;
@@ -1413,15 +1437,17 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
     }
 
     let cv = row_spacing_cv(&rows);
-    let end = j;
+    let end = trim_stepped_over_tail(j, start_idx, &mut stepped_over);
 
     if cv > TABLE_ROW_SPACING_MAX_CV {
         // Suggestive layout but the row cadence is too irregular to trust as a
         // clean table — surface as a fenced fallback so the structure is at
         // least preserved.
-        let raw: Vec<String> = rows
+        // Every line the run consumes, not only the rows: lines folded into a
+        // row's cells and stepped-over lines are inside `start..end` too.
+        let raw: Vec<String> = lines[start_idx..end]
             .iter()
-            .map(|(_, line, _)| line.text.trim_end().to_string())
+            .map(|line| line.text.trim_end().to_string())
             .collect();
         return Some(TableRun {
             start: start_idx,
@@ -1437,7 +1463,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
     // (a bold-or-filled heuristic; fills require fork data). Skipped inside
     // `finalize_table_run` when a header was absorbed.
     let bold_eligible = rows[0].2.iter().all(|c| c.bold);
-    finalize_table_run(
+    let mut run = finalize_table_run(
         lines,
         start_idx,
         floor,
@@ -1446,7 +1472,30 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         column_count,
         end,
         bold_eligible,
-    )
+    )?;
+    run.interstitials
+        .extend(stepped_over.into_iter().map(|(_, _, cell)| cell));
+    Some(run)
+}
+
+/// End of a run that stopped scanning at `j`: whole lines stepped over at the
+/// tail are left out of the run, so they're classified normally instead of
+/// being handed back out of reading order.
+fn trim_stepped_over_tail(
+    j: usize,
+    start_idx: usize,
+    stepped_over: &mut Vec<(usize, bool, Cell)>,
+) -> usize {
+    let mut end = j;
+    while end > start_idx + 1
+        && stepped_over
+            .last()
+            .is_some_and(|&(idx, whole_line, _)| whole_line && idx == end - 1)
+    {
+        stepped_over.pop();
+        end -= 1;
+    }
+    end
 }
 
 /// Walk backward from `start_idx` (not below `floor`), pulling in lines whose
@@ -6531,5 +6580,165 @@ mod tests {
             try_detect_description_list(&lines, 0).is_none(),
             "lettered list must not be detected as a description-list table"
         );
+    }
+
+    /// Every word of the lines a run consumes must survive in its block or its
+    /// interstitials: the classifier skips straight past `run.start..run.end`.
+    fn assert_run_keeps_text(lines: &[ProjectedLine], run: &TableRun) {
+        let mut kept = match &run.block {
+            Block::Table { header, rows } => header
+                .iter()
+                .flatten()
+                .chain(rows.iter().flatten())
+                .map(|c| c.text.clone())
+                .collect::<Vec<_>>()
+                .join(" "),
+            Block::GridFallback { lines } => lines.join(" "),
+            other => panic!("unexpected table block {other:?}"),
+        };
+        for note in &run.interstitials {
+            kept.push(' ');
+            kept.push_str(&note.text);
+        }
+        for line in &lines[run.start..run.end] {
+            for word in line.text.split_whitespace() {
+                assert!(
+                    kept.contains(word),
+                    "{word:?} from consumed line {:?} is missing from {:?} / {:?}",
+                    line.text,
+                    run.block,
+                    run.interstitials
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grid_fallback_keeps_lines_folded_into_a_row() {
+        // The third line wraps into the second row's last cell; the uneven row
+        // cadence (10pt then 35pt) then demotes the run to a grid fallback,
+        // which must still carry the wrapped line.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Phone", 200.0), ("Notes", 350.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Ann", 50.0), ("555-0100", 200.0), ("call first", 350.0)],
+                110.0,
+                10.0,
+            ),
+            line_with_spans(&[("after noon", 350.0)], 120.0, 10.0),
+            line_with_spans(
+                &[("Bob", 50.0), ("555-0101", 200.0), ("none", 350.0)],
+                145.0,
+                10.0,
+            ),
+        ];
+        let run = try_detect_table(&lines, 0, 0).expect("tabular enough to fall back to a grid");
+        assert!(
+            matches!(run.block, Block::GridFallback { .. }),
+            "{:?}",
+            run.block
+        );
+        assert_eq!((run.start, run.end), (0, 4));
+        assert_run_keeps_text(&lines, &run);
+    }
+
+    #[test]
+    fn cells_past_the_tracks_become_interstitials() {
+        // The second row carries a fourth cell beyond the table's right edge
+        // (another page column's text on the same baseline). The table keeps
+        // its three columns; the extra cell's text must not be dropped.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Phone", 200.0), ("Notes", 350.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[
+                    ("Ann", 50.0),
+                    ("555-0100", 200.0),
+                    ("none", 350.0),
+                    ("Fax 555-0199", 450.0),
+                ],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Bob", 50.0), ("555-0101", 200.0), ("none", 350.0)],
+                124.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Cy", 50.0), ("555-0102", 200.0), ("none", 350.0)],
+                136.0,
+                10.0,
+            ),
+        ];
+        let run = try_detect_table(&lines, 0, 0).expect("table");
+        assert!(matches!(run.block, Block::Table { .. }), "{:?}", run.block);
+        assert_eq!((run.start, run.end), (0, 4));
+        assert_run_keeps_text(&lines, &run);
+    }
+
+    #[test]
+    fn lines_right_of_the_tracks_become_interstitials() {
+        // The third line sits wholly right of the table, between its rows. The
+        // run steps over it to keep the table whole; its text must come back.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Phone", 200.0), ("Notes", 350.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Ann", 50.0), ("555-0100", 200.0), ("none", 350.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(&[("Fax 555-0199", 450.0)], 118.0, 10.0),
+            line_with_spans(
+                &[("Bob", 50.0), ("555-0101", 200.0), ("none", 350.0)],
+                124.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Cy", 50.0), ("555-0102", 200.0), ("none", 350.0)],
+                136.0,
+                10.0,
+            ),
+        ];
+        let run = try_detect_table(&lines, 0, 0).expect("table");
+        assert_eq!((run.start, run.end), (0, 5));
+        assert_run_keeps_text(&lines, &run);
+    }
+
+    #[test]
+    fn a_line_right_of_the_tracks_after_the_last_row_stays_out_of_the_run() {
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Phone", 200.0), ("Notes", 350.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Ann", 50.0), ("555-0100", 200.0), ("none", 350.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Bob", 50.0), ("555-0101", 200.0), ("none", 350.0)],
+                124.0,
+                10.0,
+            ),
+            line_with_spans(&[("Fax 555-0199", 450.0)], 136.0, 10.0),
+            line("A paragraph well below the table.", 50.0, 300.0, 10.0, 10.0),
+        ];
+        let run = try_detect_table(&lines, 0, 0).expect("table");
+        assert_eq!((run.start, run.end), (0, 3));
+        assert!(run.interstitials.is_empty());
     }
 }
