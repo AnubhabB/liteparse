@@ -8,7 +8,8 @@ use super::headings::{
 };
 use super::hr::detect_horizontal_rules;
 use super::inline::{
-    append_inline_continuation, line_uniform_style, render_line_inline, render_list_item_text,
+    append_inline_continuation, escape_inline, line_uniform_style, render_line_inline,
+    render_list_item_text,
 };
 use super::lists::{
     LIST_INDENT_STEP_PT, detect_ordered_list_lines, parse_list_marker,
@@ -571,14 +572,15 @@ fn classify_region(
             // Prose lines the run stepped over between its header and body
             // sit inside `[run.start, run.end)`, which this loop skips — emit
             // each as its own paragraph ahead of the table so the text isn't
-            // dropped.
+            // dropped. Interstitials carry raw text, like table cells, so they
+            // get the escaping a plain paragraph gets.
             for note in run.interstitials {
                 if note.text.is_empty() {
                     continue;
                 }
                 blocks.push(PositionedBlock::new(
                     Block::Paragraph {
-                        text: note.text,
+                        text: escape_inline(&collapse_whitespace(&note.text)),
                         bold: false,
                         italic: false,
                     },

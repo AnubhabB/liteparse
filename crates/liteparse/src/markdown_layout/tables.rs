@@ -1381,6 +1381,10 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         // the same line (e.g. left-table-row + right-column body text). Try
         // to recover by keeping only the cells whose center lands inside one
         // of our established column tracks; drop the rest.
+        // Cells trimmed off this row as foreign-column bleed. Handed back only
+        // once the row is accepted: a rejected row ends the run outside it, and
+        // the classifier emits that whole line itself.
+        let mut trimmed: Vec<Cell> = Vec::new();
         if cells.len() > column_count {
             let kept: Vec<TableCell> = cells
                 .iter()
@@ -1401,12 +1405,11 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
                 .filter(|c| match_track_idx(c, &track_ranges).is_none())
                 .all(|c| c.end_x < first_track_x || c.start_x > tracks_right_edge);
             if kept.len() == column_count && extras_all_outside {
-                for c in cells
+                trimmed = cells
                     .iter()
                     .filter(|c| match_track_idx(c, &track_ranges).is_none())
-                {
-                    stepped_over.push((j, false, located_cell(c, &lines[j])));
-                }
+                    .map(|c| located_cell(c, &lines[j]))
+                    .collect();
                 cells = kept;
             } else {
                 break;
@@ -1429,6 +1432,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             break;
         }
         rows.push((j, &lines[j], cells));
+        stepped_over.extend(trimmed.into_iter().map(|cell| (j, false, cell)));
         j += 1;
     }
 
@@ -5201,7 +5205,7 @@ pub(super) fn escape_table_cell(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{line, line_with_spans, rect_borders, stroke};
+    use super::super::test_helpers::{line, line_with_spans, page, rect_borders, stroke};
     use super::*;
 
     /// One PDFium run whose words sit at the given (x, width) positions.
@@ -6740,5 +6744,75 @@ mod tests {
         let run = try_detect_table(&lines, 0, 0).expect("table");
         assert_eq!((run.start, run.end), (0, 3));
         assert!(run.interstitials.is_empty());
+    }
+
+    #[test]
+    fn cells_trimmed_from_a_rejected_row_are_not_handed_back() {
+        // The third line's extra cell is trimmed as bleed, then the row fails
+        // track alignment and ends the run. The line stays outside the run, so
+        // the classifier emits it once; the trimmed cell must not come back too.
+        let lines = vec![
+            line_with_spans(
+                &[
+                    ("Medication description", 50.0),
+                    ("Route", 200.0),
+                    ("Dose", 350.0),
+                ],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Aspirin", 50.0), ("Oral", 200.0), ("81mg", 350.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[
+                    ("take", 50.0),
+                    ("daily", 120.0),
+                    ("oral", 200.0),
+                    ("Fax 555-0199", 450.0),
+                ],
+                124.0,
+                10.0,
+            ),
+        ];
+        let run = try_detect_table(&lines, 0, 0).expect("table");
+        assert_eq!(run.end, 2);
+        assert!(run.interstitials.is_empty(), "{:?}", run.interstitials);
+        let md = super::super::blocks::render_blocks(&super::super::classify::classify_page(
+            &page(lines),
+            &[],
+        ));
+        assert_eq!(md.matches("Fax 555-0199").count(), 1, "{md}");
+    }
+
+    #[test]
+    fn interstitials_are_escaped_like_paragraphs() {
+        // A stepped-over line comes back as a paragraph; its literal asterisks
+        // must not turn into emphasis.
+        let lines = vec![
+            line_with_spans(
+                &[("Name", 50.0), ("Phone", 200.0), ("Notes", 350.0)],
+                100.0,
+                10.0,
+            ),
+            line_with_spans(
+                &[("Ann", 50.0), ("555-0100", 200.0), ("none", 350.0)],
+                112.0,
+                10.0,
+            ),
+            line_with_spans(&[("Dose *as written*", 450.0)], 118.0, 10.0),
+            line_with_spans(
+                &[("Bob", 50.0), ("555-0101", 200.0), ("none", 350.0)],
+                124.0,
+                10.0,
+            ),
+        ];
+        let md = super::super::blocks::render_blocks(&super::super::classify::classify_page(
+            &page(lines),
+            &[],
+        ));
+        assert!(md.contains(r"Dose \*as written\*"), "{md}");
     }
 }
