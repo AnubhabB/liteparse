@@ -15,6 +15,10 @@ pub struct Document<'lib> {
     /// PDFium ignores `/UserUnit`, so pages carry this multiplier and apply
     /// it to all viewport-space geometry and rendering.
     pub(crate) page_user_units: Vec<f32>,
+    /// `FPDF_GetFormType` when the document was loaded. Flattening any page's
+    /// widgets drops the catalog's `/AcroForm`, after which `form_type()` reads 0
+    /// for every page, including ones still carrying widgets.
+    pub(crate) form_type_at_load: i32,
     pub(crate) _lib: std::marker::PhantomData<&'lib Library>,
 }
 
@@ -165,6 +169,14 @@ impl<'lib> Document<'lib> {
         unsafe { ffi!(FPDF_GetFormType(self.handle)) }
     }
 
+    /// [`Self::form_type`] as it was when the document was loaded, before any
+    /// [`Self::flatten_form_widgets`] removed the catalog's `/AcroForm`. Use this
+    /// to decide whether pages may carry form widgets: after one page is flattened,
+    /// `form_type()` reads 0 while every other page still has its widgets.
+    pub fn form_type_at_load(&self) -> i32 {
+        self.form_type_at_load
+    }
+
     /// Whether the catalog declares the document tagged (`/MarkInfo /Marked true`).
     /// A structure tree can be present without this flag — residual or stale
     /// tagging — so callers that treat the tree as authoritative gate on it.
@@ -263,6 +275,7 @@ impl<'lib> Document<'lib> {
         }
         let copy = Document {
             handle,
+            form_type_at_load: 0,
             page_user_units: self
                 .page_user_units
                 .get(index as usize)
