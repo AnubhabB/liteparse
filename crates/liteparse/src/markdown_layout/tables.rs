@@ -523,11 +523,8 @@ fn cell_aligns_track(cell: &TableCell, track_range: (f32, f32)) -> bool {
     false
 }
 
-/// All column tracks overlapped by `cell` (range overlap with tolerance).
-/// A two-level header label centered over two sub-columns (e.g. a year
-/// spanning `Mill. u$s | Part.`) overlaps both tracks; binding it to a
-/// single nearest track mis-pairs the year with one sub-column (#487).
-/// Returns empty when the cell overlaps no track.
+/// All column tracks overlapped by `cell` (with tolerance). Contiguous, since
+/// tracks are sorted and disjoint.
 fn spanning_track_indices(cell: &TableCell, track_ranges: &[(f32, f32)]) -> Vec<usize> {
     let tol = TABLE_TRACK_TOLERANCE_PT;
     track_ranges
@@ -538,13 +535,11 @@ fn spanning_track_indices(cell: &TableCell, track_ranges: &[(f32, f32)]) -> Vec<
         .collect()
 }
 
-/// Whether a header cell may name every track in `covered` instead of binding
-/// to one. Bare range overlap is not enough: an ordinary one-line header that
-/// runs a few points past its column would otherwise be copied into the
-/// neighbor. Replication needs a two-layer header shape: short single-token
-/// text (a year like `2001`, not prose), a cell straddling each internal gap,
-/// and a center near the spanned band, plus at least two absorbed header
-/// lines so a lone wide header never replicates.
+/// Whether a header cell overlapping several tracks should name all of them,
+/// like a year centered over `Mill. u$s | Part.` (#487). Overlap alone isn't
+/// enough — an ordinary header bleeding past its column must not be copied
+/// into the neighbor — so this requires a two-layer header, short
+/// single-token text, and a center near the middle of the spanned band.
 fn spanning_header_eligible(
     cell: &TableCell,
     covered: &[usize],
@@ -554,27 +549,24 @@ fn spanning_header_eligible(
     if covered.len() < 2 || header_lines < 2 {
         return false;
     }
-    for pair in covered.windows(2) {
-        if pair[1] != pair[0] + 1 {
-            return false;
-        }
-    }
     let text = cell.text.trim();
-    if text.is_empty() || text.chars().count() > 10 || text.chars().any(|c| c.is_whitespace()) {
+    if text.is_empty() || text.chars().count() > 10 || text.contains(char::is_whitespace) {
         return false;
-    }
-    let tol = TABLE_TRACK_TOLERANCE_PT;
-    for pair in covered.windows(2) {
-        let (_, e0) = track_ranges[pair[0]];
-        let (s1, _) = track_ranges[pair[1]];
-        if !(cell.start_x <= s1 + tol && cell.end_x >= e0 - tol) {
-            return false;
-        }
     }
     let band_start = track_ranges[covered[0]].0;
     let band_end = track_ranges[covered[covered.len() - 1]].1;
     let center = (cell.start_x + cell.end_x) * 0.5;
-    (center - (band_start + band_end) * 0.5).abs() <= tol.max(8.0)
+    (center - (band_start + band_end) * 0.5).abs() <= TABLE_TRACK_TOLERANCE_PT.max(8.0)
+}
+
+/// Whether `text` reads as part of a row label wrapped onto its own line
+/// (short, word-like, not a sentence or a value).
+fn is_label_fragment(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().count() <= 60
+        && !text.ends_with(['.', ':', ';', ','])
+        && is_alpha_dominant(text)
+        && !is_value_like(text)
 }
 
 /// Pick the best matching column index for `cell`, preferring center
@@ -1005,60 +997,31 @@ fn finalize_table_run(
         .iter()
         .map(|(_, line, cells)| cells.iter().map(|c| located_cell(c, line)).collect())
         .collect();
-    // Leading wrapped row labels: a single-cell interstitial directly above the
-    // first body row, aligned to the first column, is the first half of that
-    // row's label rather than a note (#487). E.g. "Productos primarios" above
-    // "pesqueros|663|..." becomes "Productos primarios pesqueros" instead of
-    // prose plus a "pesqueros" row.
-    if !interstitials.is_empty() && !body_rows.is_empty() && !body_rows[0].is_empty() {
-        let first_track_x = track_ranges.first().map(|r| r.0).unwrap_or(0.0);
-        let mut prepended: Vec<String> = Vec::new();
-        for inter in &interstitials {
-            let t = inter.text.trim();
-            if t.is_empty()
-                || t.len() > 60
-                || t.ends_with('.')
-                || t.ends_with(':')
-                || t.ends_with(';')
-                || t.ends_with(',')
-                || is_value_like(t)
-                || !is_alpha_dominant(t)
-            {
-                break;
-            }
-            let aligned = inter
+    // A first-column interstitial right above the body is the wrapped first
+    // half of the first row's label, not a note (#487): "Productos primarios"
+    // over "pesqueros|663|..." reads "Productos primarios pesqueros".
+    let first_track_x = track_ranges.first().map_or(0.0, |r| r.0);
+    let wrapped_label = interstitials.first().filter(|inter| {
+        is_label_fragment(inter.text.trim())
+            && inter
                 .bbox
                 .as_ref()
-                .is_some_and(|b| (b.x - first_track_x).abs() <= TABLE_TRACK_TOLERANCE_PT.max(8.0));
-            if !aligned {
-                break;
-            }
-            prepended.push(t.to_string());
+                .is_some_and(|b| (b.x - first_track_x).abs() <= TABLE_TRACK_TOLERANCE_PT.max(8.0))
+    });
+    if let (Some(inter), Some(first_cell)) = (
+        wrapped_label,
+        body_rows.first_mut().and_then(|r| r.first_mut()),
+    ) {
+        let prefix = inter.text.trim();
+        first_cell.text = if first_cell.text.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix} {}", first_cell.text)
+        };
+        if let Some(ib) = &inter.bbox {
+            Rect::extend(&mut first_cell.bbox, ib);
         }
-        if !prepended.is_empty() {
-            let prefix = prepended.join(" ");
-            if let Some(first_cell) = body_rows[0].first_mut() {
-                if !first_cell.text.is_empty() {
-                    first_cell.text = format!("{prefix} {}", first_cell.text);
-                } else {
-                    first_cell.text = prefix.clone();
-                }
-                if let (Some(cb), Some(ib)) =
-                    (first_cell.bbox.as_mut(), interstitials[0].bbox.as_ref())
-                {
-                    // Expand the label box to cover the wrapped prefix.
-                    let x0 = cb.x.min(ib.x);
-                    let y0 = cb.y.min(ib.y);
-                    let x1 = (cb.x + cb.width).max(ib.x + ib.width);
-                    let y1 = (cb.y + cb.height).max(ib.y + ib.height);
-                    cb.x = x0;
-                    cb.y = y0;
-                    cb.width = (x1 - x0).max(0.0);
-                    cb.height = (y1 - y0).max(0.0);
-                }
-            }
-            interstitials.drain(..prepended.len().min(interstitials.len()));
-        }
+        interstitials.remove(0);
     }
     if header.is_none() && body_rows.len() < TABLE_MIN_ROWS {
         return None;
@@ -1375,11 +1338,8 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
     let tracks_right_edge = track_max_x + TABLE_TRACK_TOLERANCE_PT.max(8.0);
 
     let mut j = start_idx + 1;
-    // Pending leading-label prefix: a single-cell line between two full rows
-    // that reads as the first half of the *next* row's label (e.g.
-    // "Exportaciones totales" above "pesqueras|895|...") must prefix the next
-    // row, not suffix the prior one (#487). Buffered here, prepended when the
-    // next full row is pushed.
+    // Leading half of the next row's wrapped label, prepended when that row is
+    // pushed (see the wrap path below).
     let mut pending_prefix: Vec<TableCell> = Vec::new();
     while j < lines.len() {
         // Skip lines that sit entirely to the right of the table's column
@@ -1391,9 +1351,6 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             continue;
         }
         if !table_rows_adjacent(rows.last().unwrap().1, &lines[j]) {
-            // A pending leading label with no following row to attach to is
-            // dropped here (run ends); it stays outside the table rather than
-            // corrupting the last row.
             pending_prefix.clear();
             break;
         }
@@ -1464,39 +1421,26 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
                 }
             }
             // Wrap path: tight stack against prior row, multi-line cell
-            // continuation — except a single-cell first-column line that reads
-            // as the *leading* half of the next row's label. When the next
-            // line is a full data row whose first cell is a single short word
-            // (e.g. "pesqueras") and the current line is longer (e.g.
-            // "Exportaciones totales"), buffer the current line as a prefix
-            // for the next row instead of suffixing the prior row (#487).
+            // continuation. Exception (#487): a first-column line followed by
+            // a full row whose label is one short word ("Exportaciones
+            // totales" over "pesqueras|895|...") is the leading half of the
+            // next row's label, so it's buffered rather than appended here.
             if centroid_dy <= line_height * 1.5 && all_align_track {
                 let is_leading_label = cells.len() == 1
-                    && mapping.len() == 1
                     && mapping[0] == 0
                     && pending_prefix.len() < 2
                     && j + 1 < lines.len()
                     && {
                         let next_cells = split_cells(&lines[j + 1]);
+                        let cur_text = cells[0].text.trim();
+                        let next_first = next_cells.first().map_or("", |c| c.text.trim());
                         next_cells.len() == column_count
                             && table_rows_adjacent(&lines[j], &lines[j + 1])
-                            && {
-                                let cur_text = cells[0].text.trim();
-                                let next_first = next_cells[0].text.trim();
-                                let next_words = next_first.split_whitespace().count();
-                                next_words == 1
-                                    && next_first.chars().count() <= 12
-                                    && cur_text.chars().count() > next_first.chars().count()
-                                    && cur_text.chars().count() <= 60
-                                    && !cur_text.ends_with('.')
-                                    && !cur_text.ends_with(':')
-                                    && !cur_text.ends_with(';')
-                                    && !cur_text.ends_with(',')
-                                    && is_alpha_dominant(cur_text)
-                                    && !is_value_like(cur_text)
-                                    && is_alpha_dominant(next_first)
-                                    && !is_value_like(next_first)
-                            }
+                            && !next_first.contains(char::is_whitespace)
+                            && next_first.chars().count() <= 12
+                            && cur_text.chars().count() > next_first.chars().count()
+                            && is_label_fragment(cur_text)
+                            && is_label_fragment(next_first)
                     };
                 if is_leading_label {
                     pending_prefix.push(cells[0].clone());
@@ -1562,7 +1506,6 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             break;
         }
         if !pending_prefix.is_empty() {
-            // Prepend buffered leading-label halves to this row's first cell.
             let prefix = pending_prefix
                 .iter()
                 .map(|c| c.text.trim())
@@ -1751,14 +1694,8 @@ fn absorb_header_lines(
     let mut header = vec![Cell::default(); column_count];
     for (line_idx, cells) in &absorbed {
         for c in cells {
-            // A header cell spanning several tracks (a year centered over two
-            // sub-columns) names each covered column (#487), but only when it
-            // reads as a two-layer spanning label. An ordinary header that
-            // runs past its column keeps the single nearest-track binding.
             let covered = spanning_track_indices(c, track_ranges);
-            let indices: Vec<usize> = if covered.len() >= 2
-                && spanning_header_eligible(c, &covered, track_ranges, absorbed.len())
-            {
+            let indices = if spanning_header_eligible(c, &covered, track_ranges, absorbed.len()) {
                 covered
             } else {
                 match match_track_idx(c, track_ranges) {
@@ -5445,8 +5382,7 @@ mod tests {
 
     #[test]
     fn spanning_year_header_covers_both_subcolumns() {
-        // #487: a year centered over `Mill. u$s | Part.` overlaps both tracks
-        // and must name both columns, not bind to the nearest one.
+        // #487: a year centered over `Mill. u$s | Part.`.
         let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
         let year = TableCell {
             start_x: 170.0,
@@ -5455,7 +5391,6 @@ mod tests {
             bold: false,
         };
         assert_eq!(spanning_track_indices(&year, &tracks), vec![0, 1]);
-        // A plain sub-header covers a single track.
         let mill = TableCell {
             start_x: 152.0,
             end_x: 167.0,
@@ -5467,8 +5402,6 @@ mod tests {
 
     #[test]
     fn year_header_is_eligible_to_name_both_subcolumns() {
-        // #487/#490 review: a year centered over two sub-columns replicates,
-        // but only inside a real two-layer header.
         let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
         let year = TableCell {
             start_x: 170.0,
@@ -5483,8 +5416,6 @@ mod tests {
 
     #[test]
     fn single_header_line_never_replicates() {
-        // Review finding: an ordinary one-line header that runs past its
-        // column must not be copied into the neighbor.
         let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
         let year = TableCell {
             start_x: 170.0,
@@ -5498,8 +5429,7 @@ mod tests {
 
     #[test]
     fn wide_single_token_header_stays_in_its_column() {
-        // Left-aligned "Revenue" bleeding 5pt into the next track is centered
-        // in its own column, not over the gap, so it keeps one binding.
+        // Bleeds into the next track but is centered in its own column.
         let tracks = vec![(100.0, 150.0), (160.0, 200.0)];
         let cell = TableCell {
             start_x: 100.0,
