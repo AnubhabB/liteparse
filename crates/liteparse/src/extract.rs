@@ -151,7 +151,9 @@ pub fn extract_pages_and_images(
     let mut flattened_page_numbers: Vec<u32> = Vec::new();
     // One FFI call keeps the per-page annotation walk off the hot path for
     // every document without an AcroForm catalog, which is nearly all of them.
-    let document_has_form = document.form_type() != 0;
+    // Read at load, not now: an earlier `extract` call on this document may have
+    // flattened a page, which drops `/AcroForm` for the whole document.
+    let document_has_form = document.form_type_at_load() != 0;
     let form_environment = output_options
         .extract_form_fields
         .then(|| document.form_environment())

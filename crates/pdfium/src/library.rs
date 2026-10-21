@@ -133,6 +133,7 @@ impl Library {
         Ok(Document {
             handle,
             page_user_units,
+            form_type_at_load: unsafe { ffi!(FPDF_GetFormType(handle)) },
             _lib: std::marker::PhantomData,
         })
     }
@@ -169,6 +170,7 @@ impl Library {
             } else {
                 Self::page_user_units(handle, data)
             },
+            form_type_at_load: unsafe { ffi!(FPDF_GetFormType(handle)) },
             _lib: std::marker::PhantomData,
         })
     }
