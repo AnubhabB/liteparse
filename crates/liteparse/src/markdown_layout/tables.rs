@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::types::{GraphicPrimitive, ProjectedLine, Rect, TextItem};
 
 use super::blocks::{Block, Cell};
@@ -4183,6 +4185,77 @@ fn assign_cells(
     // is a no-op there.
     let mut line_order: Vec<usize> = (0..lines.len()).collect();
     line_order.sort_by(|&a, &b| lines[a].bbox.y.total_cmp(&lines[b].bbox.y));
+
+    // Running prose ends the table, but a full-width merged note row inside a
+    // ruled table ("(1) Amounts reflect the restatement described in Note 4,
+    // ...") has the same shape and is followed by further cell-aligned rows;
+    // stopping there would spill the rest of the table into loose lines. So a
+    // single prose line only stops the table below the last cell-aligned rows.
+    let prose_stop = if stop_at_running_prose {
+        let in_grid_row = |idx: usize| {
+            let line = &lines[idx];
+            let cy = line.bbox.y + line.bbox.height * 0.5;
+            if cy < ys[0] || cy > ys[n_rows] || line.text.trim().is_empty() {
+                return None;
+            }
+            find_bucket(ys, cy)
+        };
+        // A table row: text inside the grid, spread over 2+ columns, with no
+        // span straddling an interior boundary. A prose line's runs cut
+        // through the boundaries instead.
+        let is_cell_aligned_row = |line: &ProjectedLine| {
+            let line_x1 = line.bbox.x + line.bbox.width;
+            if line.bbox.x < xs[0] - GRID_X_SLACK_PT || line_x1 > xs[n_cols] + GRID_X_SLACK_PT {
+                return false;
+            }
+            let mut cols = HashSet::new();
+            for span in line.spans.iter().filter(|s| !s.text.trim().is_empty()) {
+                let m0 = (span.x + STRADDLE_MARGIN_PT).clamp(xs[0], xs[n_cols]);
+                let m1 = (span.x + span.width - STRADDLE_MARGIN_PT).clamp(xs[0], xs[n_cols]);
+                if m1 > m0 && find_bucket(xs, m0) != find_bucket(xs, m1) {
+                    return false;
+                }
+                let cx = (span.x + span.width * 0.5).clamp(xs[0], xs[n_cols]);
+                cols.extend(find_bucket(xs, cx));
+            }
+            cols.len() >= 2
+        };
+        let eligible: Vec<(usize, usize)> = line_order
+            .iter()
+            .filter_map(|&idx| in_grid_row(idx).map(|row| (idx, row)))
+            .collect();
+        // Require two table rows below a candidate: a single trailing line
+        // in 2+ columns is as likely a page footer as a table row.
+        let mut aligned_seen = 0usize;
+        let mut first_candidate = eligible.len();
+        for (pos, &(idx, _)) in eligible.iter().enumerate().rev() {
+            if is_cell_aligned_row(&lines[idx]) {
+                aligned_seen += 1;
+                if aligned_seen >= 2 {
+                    break;
+                }
+            }
+            first_candidate = pos;
+        }
+        // Above that cutoff, still stop when a second prose line follows: a
+        // paragraph between two tables sharing one ruled grid, or a form page
+        // interleaving prose with checkbox rows. A lone note row has neither.
+        let mut prose_positions = eligible
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(idx, row))| {
+                should_stop_at_running_prose(&lines[idx], xs, row, idx, dbg)
+            })
+            .map(|(pos, _)| pos);
+        match (prose_positions.next(), prose_positions.next()) {
+            (Some(pos), Some(_)) => Some(eligible[pos].0),
+            (Some(pos), None) if pos >= first_candidate => Some(eligible[pos].0),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     for idx in line_order {
         let line = &lines[idx];
         let cy = line.bbox.y + line.bbox.height * 0.5;
@@ -4200,7 +4273,7 @@ fn assign_cells(
         if line.text.trim().is_empty() {
             continue;
         }
-        if stop_at_running_prose && should_stop_at_running_prose(line, xs, row, idx, dbg) {
+        if prose_stop == Some(idx) {
             if dbg {
                 eprintln!(
                     "[ruled] stop at running prose line idx={idx} row={row}: {:?}",
@@ -5791,6 +5864,89 @@ mod tests {
             [0],
             "the first data row has no prior assigned cells"
         );
+    }
+
+    fn at_y(mut line: ProjectedLine, y: f32) -> ProjectedLine {
+        line.bbox.y = y;
+        for span in &mut line.spans {
+            span.y = y;
+            for word in &mut span.words {
+                word.y = y;
+            }
+        }
+        line
+    }
+
+    fn data_row(cells: &[&str], y: f32) -> ProjectedLine {
+        let spans: Vec<_> = cells
+            .iter()
+            .enumerate()
+            .map(|(c, text)| {
+                let words = [*text];
+                prose_test_span(
+                    &prose_test_words(&words, 10.0 + 100.0 * c as f32, 5.0, 2.0),
+                    10.0,
+                )
+            })
+            .collect();
+        at_y(prose_test_line(&cells.join(" "), spans, 10.0), y)
+    }
+
+    fn prose_row(y: f32) -> ProjectedLine {
+        let text = "During the year ended September 30, 2025, compensation expense increased $1.3 billion, or 2.8%, compared";
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let positions = prose_test_words(&words, 10.0, 3.0, 2.0);
+        at_y(
+            prose_test_line(text, vec![prose_test_span(&positions, 10.0)], 10.0),
+            y,
+        )
+    }
+
+    #[test]
+    fn merged_note_row_mid_table_keeps_rows_below() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            prose_row(25.0),
+            data_row(&["Debt", "500", "600"], 45.0),
+            data_row(&["Equity", "500", "300"], 65.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
+
+        assert!(should_stop_at_running_prose(&lines[1], &xs, 1, 1, false));
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn prose_paragraph_between_tables_stops() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            prose_row(25.0),
+            prose_row(45.0),
+            data_row(&["Debt", "500", "600"], 65.0),
+            data_row(&["Equity", "500", "300"], 85.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
+
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0]);
+    }
+
+    #[test]
+    fn running_prose_below_table_still_stops() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            data_row(&["Debt", "500", "600"], 25.0),
+            prose_row(45.0),
+            prose_row(65.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
+
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0, 1]);
     }
 
     #[test]
