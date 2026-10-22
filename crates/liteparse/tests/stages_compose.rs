@@ -702,3 +702,164 @@ async fn extracted_pages_round_trip_keeps_internal_fields() {
         }
     }
 }
+
+/// `extract` over a page subset must give each page what one call over the whole
+/// document gives it, on the same open document, so a caller can extract page by
+/// page (or batch by batch) without reopening. Extraction mutates the document
+/// (widget flattening), so this is not automatic; see
+/// `widget_text_survives_extracting_an_earlier_page_first` for the case that broke.
+#[tokio::test]
+#[serial]
+async fn extract_page_by_page_equals_one_call_on_one_document() {
+    if skip_integration() {
+        return;
+    }
+    let parser = LiteParse::new(LiteParseConfig {
+        output_format: OutputFormat::Markdown,
+        ..LiteParseConfig::default()
+    });
+    let lib = Library::init();
+    let mut flattened_pages = 0;
+    for pdf in corpus_pdfs() {
+        let input = PdfInput::Path(pdf.clone());
+        let Ok(document) = stages::open(&lib, &input, None, &[]) else {
+            continue;
+        };
+        let Ok(whole) = stages::extract(&document, &parser.extract_request(None, usize::MAX))
+        else {
+            continue;
+        };
+        flattened_pages += whole.flattened_page_numbers.len();
+        drop(document);
+        let document = stages::open(&lib, &input, None, &[]).unwrap();
+        for expected in &whole.pages {
+            let target = [expected.page_number as u32];
+            let one = stages::extract(
+                &document,
+                &parser.extract_request(Some(&target), usize::MAX),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&one.pages[0]).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{pdf} page {}: extracted alone differs from the whole-document call",
+                expected.page_number
+            );
+        }
+    }
+    assert!(
+        flattened_pages > 1,
+        "the corpus should have a document with several flattened form pages"
+    );
+}
+
+/// Two pages, each with a text widget painting a running header, where the form's
+/// only listed field is a signature on page 1: the header widgets are not in
+/// `/Fields`. This is how a 2009 government gazette in the platform's corpus is
+/// built. Flattening page 1 removes the signature field, and pdfium then drops the
+/// empty `/AcroForm`, so the document's form type reads 0 from then on.
+fn signed_form_with_orphan_header_widgets_pdf() -> Vec<u8> {
+    use lopdf::{Document, Object, Stream, StringFormat, dictionary};
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let mut page_ids = Vec::new();
+    let mut signature_id = None;
+    for body in ["First page body", "Second page body"] {
+        let page_id = doc.new_object_id();
+        let appearance = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 20.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+            },
+            b"BT /Helv 12 Tf 2 5 Td (Running header) Tj ET".to_vec(),
+        ));
+        let header_id = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "P" => page_id,
+            "T" => Object::String(b"header".to_vec(), StringFormat::Literal),
+            "V" => Object::String(b"Running header".to_vec(), StringFormat::Literal),
+            "Rect" => vec![50.into(), 750.into(), 250.into(), 770.into()], "F" => 4,
+            "AP" => dictionary! { "N" => appearance },
+        });
+        let mut annots = vec![Object::Reference(header_id)];
+        if signature_id.is_none() {
+            let id = doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig", "P" => page_id,
+                "T" => Object::String(b"Signature1".to_vec(), StringFormat::Literal),
+                "Rect" => vec![0.into(), 0.into(), 0.into(), 0.into()], "F" => 132,
+            });
+            annots.push(Object::Reference(id));
+            signature_id = Some(id);
+        }
+        let content = format!("BT /Helv 11 Tf 50 600 Td ({body}) Tj ET");
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+                "Annots" => annots,
+                "Contents" => content_id,
+            }),
+        );
+        page_ids.push(page_id);
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>(),
+            "Count" => 2,
+        }),
+    );
+    let acroform_id = doc.add_object(dictionary! {
+        "Fields" => vec![Object::Reference(signature_id.expect("page 1 has the signature"))],
+        "SigFlags" => 3,
+    });
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog", "Pages" => pages_id, "AcroForm" => acroform_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[tokio::test]
+#[serial]
+async fn widget_text_survives_extracting_an_earlier_page_first() {
+    let parser = LiteParse::new(LiteParseConfig {
+        output_format: OutputFormat::Markdown,
+        ..LiteParseConfig::default()
+    });
+    let lib = Library::init();
+    let input = PdfInput::Bytes(signed_form_with_orphan_header_widgets_pdf());
+    let document = stages::open(&lib, &input, None, &[]).unwrap();
+    let texts: Vec<String> = [1u32, 2]
+        .iter()
+        .map(|&n| {
+            let target = [n];
+            let extracted = stages::extract(
+                &document,
+                &parser.extract_request(Some(&target), usize::MAX),
+            )
+            .unwrap();
+            assert_eq!(
+                extracted.flattened_page_numbers,
+                [n],
+                "page {n} widgets flattened"
+            );
+            extracted.pages[0]
+                .text_items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect()
+        })
+        .collect();
+    assert!(texts[0].contains("Running header"), "page 1: {}", texts[0]);
+    assert!(texts[1].contains("Running header"), "page 2: {}", texts[1]);
+}

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::types::{GraphicPrimitive, ProjectedLine, Rect, TextItem};
 
 use super::blocks::{Block, Cell};
@@ -523,6 +525,52 @@ fn cell_aligns_track(cell: &TableCell, track_range: (f32, f32)) -> bool {
     false
 }
 
+/// All column tracks overlapped by `cell` (with tolerance). Contiguous, since
+/// tracks are sorted and disjoint.
+fn spanning_track_indices(cell: &TableCell, track_ranges: &[(f32, f32)]) -> Vec<usize> {
+    let tol = TABLE_TRACK_TOLERANCE_PT;
+    track_ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, (s, e))| cell.start_x <= e + tol && cell.end_x >= s - tol)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether a header cell overlapping several tracks should name all of them,
+/// like a year centered over `Mill. u$s | Part.` (#487). Overlap alone isn't
+/// enough — an ordinary header bleeding past its column must not be copied
+/// into the neighbor — so this requires a two-layer header, short
+/// single-token text, and a center near the middle of the spanned band.
+fn spanning_header_eligible(
+    cell: &TableCell,
+    covered: &[usize],
+    track_ranges: &[(f32, f32)],
+    header_lines: usize,
+) -> bool {
+    if covered.len() < 2 || header_lines < 2 {
+        return false;
+    }
+    let text = cell.text.trim();
+    if text.is_empty() || text.chars().count() > 10 || text.contains(char::is_whitespace) {
+        return false;
+    }
+    let band_start = track_ranges[covered[0]].0;
+    let band_end = track_ranges[covered[covered.len() - 1]].1;
+    let center = (cell.start_x + cell.end_x) * 0.5;
+    (center - (band_start + band_end) * 0.5).abs() <= TABLE_TRACK_TOLERANCE_PT.max(8.0)
+}
+
+/// Whether `text` reads as part of a row label wrapped onto its own line
+/// (short, word-like, not a sentence or a value).
+fn is_label_fragment(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().count() <= 60
+        && !text.ends_with(['.', ':', ';', ','])
+        && is_alpha_dominant(text)
+        && !is_value_like(text)
+}
+
 /// Pick the best matching column index for `cell`, preferring center
 /// containment, then start_x match, then end_x match. Returns `None` when no
 /// column aligns.
@@ -930,7 +978,7 @@ fn finalize_table_run(
     // 1 when the bold-first-row promotion consumes rows[0].
     let first_row = &rows[0].2;
     let bold_header_qualifies = absorbed.is_none() && bold_first_row_eligible;
-    let (run_start, header, row_start, interstitials) = match absorbed {
+    let (run_start, header, row_start, mut interstitials) = match absorbed {
         Some((hstart, header_texts, interstitials)) => {
             (hstart, Some(header_texts), 0, interstitials)
         }
@@ -947,10 +995,36 @@ fn finalize_table_run(
         ),
         None => (start_idx, None, 0, Vec::new()),
     };
-    let body_rows: Vec<Vec<Cell>> = rows[row_start..]
+    let mut body_rows: Vec<Vec<Cell>> = rows[row_start..]
         .iter()
         .map(|(_, line, cells)| cells.iter().map(|c| located_cell(c, line)).collect())
         .collect();
+    // A first-column interstitial right above the body is the wrapped first
+    // half of the first row's label, not a note (#487): "Productos primarios"
+    // over "pesqueros|663|..." reads "Productos primarios pesqueros".
+    let first_track_x = track_ranges.first().map_or(0.0, |r| r.0);
+    let wrapped_label = interstitials.first().filter(|inter| {
+        is_label_fragment(inter.text.trim())
+            && inter
+                .bbox
+                .as_ref()
+                .is_some_and(|b| (b.x - first_track_x).abs() <= TABLE_TRACK_TOLERANCE_PT.max(8.0))
+    });
+    if let (Some(inter), Some(first_cell)) = (
+        wrapped_label,
+        body_rows.first_mut().and_then(|r| r.first_mut()),
+    ) {
+        let prefix = inter.text.trim();
+        first_cell.text = if first_cell.text.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix} {}", first_cell.text)
+        };
+        if let Some(ib) = &inter.bbox {
+            Rect::extend(&mut first_cell.bbox, ib);
+        }
+        interstitials.remove(0);
+    }
     if header.is_none() && body_rows.len() < TABLE_MIN_ROWS {
         return None;
     }
@@ -1279,6 +1353,9 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
     // than dropped; `true` marks a whole stepped-over line.
     let mut stepped_over: Vec<(usize, bool, Cell)> = Vec::new();
     let mut j = start_idx + 1;
+    // Leading half of the next row's wrapped label, prepended when that row is
+    // pushed (see the wrap path below).
+    let mut pending_prefix: Vec<TableCell> = Vec::new();
     while j < lines.len() {
         // Skip lines that sit entirely to the right of the table's column
         // tracks — almost certainly content from a different page column.
@@ -1294,6 +1371,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             continue;
         }
         if !table_rows_adjacent(rows.last().unwrap().1, &lines[j]) {
+            pending_prefix.clear();
             break;
         }
         let mut cells = split_cells(&lines[j]);
@@ -1362,9 +1440,33 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
                     continue;
                 }
             }
-            // Wrap path (existing, unchanged): tight stack against prior
-            // row, multi-line cell continuation.
+            // Wrap path: tight stack against prior row, multi-line cell
+            // continuation. Exception (#487): a first-column line followed by
+            // a full row whose label is one short word ("Exportaciones
+            // totales" over "pesqueras|895|...") is the leading half of the
+            // next row's label, so it's buffered rather than appended here.
             if centroid_dy <= line_height * 1.5 && all_align_track {
+                let is_leading_label = cells.len() == 1
+                    && mapping[0] == 0
+                    && pending_prefix.len() < 2
+                    && j + 1 < lines.len()
+                    && {
+                        let next_cells = split_cells(&lines[j + 1]);
+                        let cur_text = cells[0].text.trim();
+                        let next_first = next_cells.first().map_or("", |c| c.text.trim());
+                        next_cells.len() == column_count
+                            && table_rows_adjacent(&lines[j], &lines[j + 1])
+                            && !next_first.contains(char::is_whitespace)
+                            && next_first.chars().count() <= 12
+                            && cur_text.chars().count() > next_first.chars().count()
+                            && is_label_fragment(cur_text)
+                            && is_label_fragment(next_first)
+                    };
+                if is_leading_label {
+                    pending_prefix.push(cells[0].clone());
+                    j += 1;
+                    continue;
+                }
                 let prev_cells = &mut rows.last_mut().unwrap().2;
                 for (c, &idx) in cells.iter().zip(&mapping) {
                     if !prev_cells[idx].text.is_empty() && !c.text.is_empty() {
@@ -1429,7 +1531,24 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
             .filter(|(c, r)| !cell_aligns_track(c, **r))
             .count();
         if misaligned > 1 {
+            pending_prefix.clear();
             break;
+        }
+        if !pending_prefix.is_empty() {
+            let prefix = pending_prefix
+                .iter()
+                .map(|c| c.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !prefix.is_empty() && !cells.is_empty() {
+                if !cells[0].text.is_empty() {
+                    cells[0].text = format!("{prefix} {}", cells[0].text);
+                } else {
+                    cells[0].text = prefix;
+                }
+            }
+            pending_prefix.clear();
         }
         rows.push((j, &lines[j], cells));
         stepped_over.extend(trimmed.into_iter().map(|cell| (j, false, cell)));
@@ -1630,14 +1749,22 @@ fn absorb_header_lines(
     let mut header = vec![Cell::default(); column_count];
     for (line_idx, cells) in &absorbed {
         for c in cells {
-            let Some(idx) = match_track_idx(c, track_ranges) else {
-                continue;
+            let covered = spanning_track_indices(c, track_ranges);
+            let indices = if spanning_header_eligible(c, &covered, track_ranges, absorbed.len()) {
+                covered
+            } else {
+                match match_track_idx(c, track_ranges) {
+                    Some(idx) => vec![idx],
+                    None => continue,
+                }
             };
-            if !header[idx].text.is_empty() && !c.text.is_empty() {
-                header[idx].text.push(' ');
+            for idx in indices {
+                if !header[idx].text.is_empty() && !c.text.is_empty() {
+                    header[idx].text.push(' ');
+                }
+                header[idx].text.push_str(&c.text);
+                Rect::extend(&mut header[idx].bbox, &cell_rect(c, &lines[*line_idx]));
             }
-            header[idx].text.push_str(&c.text);
-            Rect::extend(&mut header[idx].bbox, &cell_rect(c, &lines[*line_idx]));
         }
     }
     // A header reached via a skip is held to a coverage bar: it must name at
@@ -2471,26 +2598,20 @@ fn cluster_adjacent(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> bool
         // check, failed-row fraction) still gate the actual merge.
         return true;
     };
-    let (narrow, wide) = if a_tracks.len() <= b_tracks.len() {
-        (&a_tracks, &b_tracks)
-    } else {
-        (&b_tracks, &a_tracks)
-    };
-    let matched = narrow
-        .iter()
-        .filter(|&&t| {
-            wide.iter()
-                .any(|&w| subset_match_score(t, w, TABLE_SUBSET_TRACK_TOLERANCE_PT).is_some())
-        })
-        .count();
-    let ok = (matched as f32) >= (narrow.len() as f32) * 0.75;
+    let (matched, total) = matching_track_count(&a_tracks, &b_tracks);
+    let ok = (matched as f32) >= (total as f32) * 0.75;
     if !ok && dbgt {
+        let (narrow, wide) = if a_tracks.len() <= b_tracks.len() {
+            (&a_tracks, &b_tracks)
+        } else {
+            (&b_tracks, &a_tracks)
+        };
         eprintln!(
             "[tbl-cluster] adjacency reject @{}..{}: tracks {}/{} matched (narrow=[{}] wide=[{}])",
             a.start,
             b.end,
             matched,
-            narrow.len(),
+            total,
             narrow
                 .iter()
                 .map(|t| format!("{:.0}-{:.0}", t.0, t.1))
@@ -2592,35 +2713,70 @@ fn union_header_from_above(
     lines: &[ProjectedLine],
     body_start: usize,
     floor: usize,
-    tracks: &[f32],
-) -> Option<(usize, Vec<Cell>)> {
+    tracks: &[(f32, f32)],
+    allow_single_interstitial: bool,
+) -> Option<(usize, Vec<Cell>, Vec<Cell>)> {
+    let dbgt = *super::flags::DEBUG_TABLE;
     let tol = TABLE_TRACK_TOLERANCE_PT;
+    if allow_single_interstitial && dbgt {
+        eprintln!(
+            "[tbl-cross-region-header] body tracks=[{}]",
+            tracks
+                .iter()
+                .map(|(start, end)| {
+                    if start.is_finite() && end.is_finite() && start <= end {
+                        format!("{start:.1}..{end:.1}")
+                    } else {
+                        "empty".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let valid_track_centers: Vec<(usize, f32)> = tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (start, end))| {
+            (start.is_finite() && end.is_finite() && start <= end)
+                .then_some((idx, (start + end) * 0.5))
+        })
+        .collect();
     // Fallback assignment for centered header cells whose extent doesn't
-    // reach the track anchor: nearest track within half the local gap.
+    // reach the track anchor: nearest track within half the local gap, with a
+    // small extra margin for cross-region header absorption.
     let assign_nearest = |x_center: f32| -> Option<usize> {
-        let (idx, d) = tracks
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| (i, (x_center - t).abs()))
-            .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        let local_gap = if idx + 1 < tracks.len() {
-            tracks[idx + 1] - tracks[idx]
-        } else if idx > 0 {
-            tracks[idx] - tracks[idx - 1]
+        let (position, &(idx, center)) =
+            valid_track_centers
+                .iter()
+                .enumerate()
+                .min_by(|(_, (_, a)), (_, (_, b))| {
+                    (x_center - *a).abs().total_cmp(&(x_center - *b).abs())
+                })?;
+        let d = (x_center - center).abs();
+        let local_gap = if position + 1 < valid_track_centers.len() {
+            valid_track_centers[position + 1].1 - center
+        } else if position > 0 {
+            center - valid_track_centers[position - 1].1
         } else {
             f32::INFINITY
         };
-        if d <= (local_gap * 0.5).max(TABLE_SUBSET_TRACK_TOLERANCE_PT) {
+        let edge_tolerance = if allow_single_interstitial { tol } else { 0.0 };
+        if d <= (local_gap * 0.5 + edge_tolerance).max(TABLE_SUBSET_TRACK_TOLERANCE_PT) {
             Some(idx)
         } else {
             None
         }
     };
     let mut layers: Vec<Vec<Cell>> = Vec::new();
+    let mut skipped = None;
     let mut j = body_start;
     while j > floor && layers.len() < TABLE_CLUSTER_MAX_HEADER_LINES {
         let cand = j - 1;
         if !table_rows_adjacent(&lines[cand], &lines[j]) {
+            if allow_single_interstitial && dbgt {
+                eprintln!("[tbl-cross-region-header] stop @{cand}: not adjacent to line {j}");
+            }
             break;
         }
         let spans: Vec<&TextItem> = lines[cand]
@@ -2629,6 +2785,18 @@ fn union_header_from_above(
             .filter(|s| !s.text.trim().is_empty())
             .collect();
         if spans.len() < 2 {
+            if allow_single_interstitial
+                && layers.is_empty()
+                && skipped.is_none()
+                && spans.len() == 1
+            {
+                if dbgt {
+                    eprintln!("[tbl-cross-region-header] skip single-cell line @{cand}");
+                }
+                skipped = Some(cand);
+                j = cand;
+                continue;
+            }
             break;
         }
         let mut layer = vec![Cell::default(); tracks.len()];
@@ -2636,10 +2804,25 @@ fn union_header_from_above(
         for s in &spans {
             let x0 = s.x;
             let x1 = s.x + s.width.max(0.0);
+            let header_cell = TableCell {
+                start_x: x0,
+                end_x: x1,
+                text: String::new(),
+                bold: false,
+            };
             let covered: Vec<usize> = tracks
                 .iter()
                 .enumerate()
-                .filter(|&(_, &t)| t >= x0 - tol && t <= x1 + tol)
+                .filter(|&(_, range)| {
+                    if !range.0.is_finite() || !range.1.is_finite() || range.0 > range.1 {
+                        return false;
+                    }
+                    if (range.1 - range.0).abs() <= f32::EPSILON {
+                        range.0 >= x0 - tol && range.0 <= x1 + tol
+                    } else {
+                        cell_aligns_track(&header_cell, *range)
+                    }
+                })
                 .map(|(i, _)| i)
                 .collect();
             let targets: Vec<usize> = if !covered.is_empty() {
@@ -2647,6 +2830,12 @@ fn union_header_from_above(
             } else if let Some(idx) = assign_nearest((x0 + x1) * 0.5) {
                 vec![idx]
             } else {
+                if allow_single_interstitial && dbgt {
+                    eprintln!(
+                        "[tbl-cross-region-header] unassigned @{cand} {:?} x={x0:.1}..{x1:.1}",
+                        s.text.trim()
+                    );
+                }
                 ok = false;
                 break;
             };
@@ -2668,12 +2857,18 @@ fn union_header_from_above(
             }
         }
         if !ok || layer.iter().filter(|t| !t.text.is_empty()).count() < 2 {
+            if allow_single_interstitial && dbgt {
+                eprintln!("[tbl-cross-region-header] stop @{cand}: spans don't align");
+            }
             break;
         }
         layers.push(layer);
         j = cand;
     }
     if layers.is_empty() {
+        if allow_single_interstitial && dbgt {
+            eprintln!("[tbl-cross-region-header] no aligned header layers");
+        }
         return None;
     }
     layers.reverse();
@@ -2700,7 +2895,23 @@ fn union_header_from_above(
     if header.iter().all(|h| h.text.is_empty()) {
         return None;
     }
-    Some((j, header))
+    if skipped.is_some()
+        && header.iter().filter(|cell| !cell.text.is_empty()).count() * 3 < tracks.len()
+    {
+        if dbgt {
+            eprintln!(
+                "[tbl-cross-region-header] reject sparse header: {}/{} columns",
+                header.iter().filter(|cell| !cell.text.is_empty()).count(),
+                tracks.len()
+            );
+        }
+        return None;
+    }
+    let interstitials = skipped
+        .into_iter()
+        .map(|idx| Cell::located(lines[idx].text.trim().to_string(), lines[idx].bbox.clone()))
+        .collect();
+    Some((j, header, interstitials))
 }
 
 /// Re-extract a cluster of adjacent table runs as one table against the
@@ -2819,10 +3030,11 @@ fn build_union_table(
         return None;
     }
 
-    let absorbed = union_header_from_above(lines, window_start, floor, &tracks);
-    let (start, header) = match absorbed {
-        Some((hstart, header)) => (hstart, Some(header)),
-        None => (window_start, None),
+    let track_ranges: Vec<(f32, f32)> = tracks.iter().map(|&track| (track, track)).collect();
+    let absorbed = union_header_from_above(lines, window_start, floor, &track_ranges, false);
+    let (start, header, interstitials) = match absorbed {
+        Some((hstart, header, interstitials)) => (hstart, Some(header), interstitials),
+        None => (window_start, None, Vec::new()),
     };
     Some(TableRun {
         start,
@@ -2832,7 +3044,7 @@ fn build_union_table(
         // starts at the first fragment's body and `union_header_from_above`
         // stops at prose, so any stepped-over line lands outside the new span
         // and is classified normally — preserved as a paragraph, not dropped.
-        interstitials: Vec::new(),
+        interstitials,
         bbox: lines_bbox(lines, start, window_end),
         block: Block::Table { header, rows },
     })
@@ -2848,11 +3060,7 @@ fn run_column_count(run: &TableRun) -> Option<usize> {
     }
 }
 
-/// Re-derive column tracks from the run's source lines. Aggregates min start_x
-/// and max end_x across *every* line whose `split_cells` count matches the
-/// run's declared column count, so a column with tight per-row content (e.g.
-/// a right-aligned numeric body cell) still produces a track wide enough to
-/// match a wider header cell that aligns to the same column.
+/// Re-derive column tracks from source lines for adjacency and table merging.
 fn run_body_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, f32)>> {
     let n_cols = run_column_count(run)?;
     let mut acc: Option<Vec<(f32, f32)>> = None;
@@ -2872,6 +3080,100 @@ fn run_body_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, 
         });
     }
     acc
+}
+
+/// Re-derive cross-region header tracks from located body cells where possible,
+/// falling back to source lines.
+fn cross_region_header_tracks(run: &TableRun, lines: &[ProjectedLine]) -> Option<Vec<(f32, f32)>> {
+    let n_cols = run_column_count(run)?;
+    let mut acc = vec![None; n_cols];
+    if let Block::Table { rows, .. } = &run.block {
+        for row in rows.iter().filter(|row| row.len() == n_cols) {
+            for (idx, cell) in row.iter().enumerate() {
+                if cell.text.trim().is_empty() {
+                    continue;
+                }
+                let Some(bbox) = &cell.bbox else {
+                    continue;
+                };
+                let range = (bbox.x, bbox.x + bbox.width);
+                acc[idx] = Some(
+                    acc[idx].map_or(range, |(s, e): (f32, f32)| (s.min(range.0), e.max(range.1))),
+                );
+            }
+        }
+    }
+    for line in &lines[run.body_start..run.end.min(lines.len())] {
+        let cells = split_cells(line);
+        if cells.len() != n_cols {
+            continue;
+        }
+        for (idx, cell) in cells.iter().enumerate() {
+            let range = (cell.start_x, cell.end_x);
+            acc[idx] =
+                Some(acc[idx].map_or(range, |(s, e): (f32, f32)| (s.min(range.0), e.max(range.1))));
+        }
+    }
+    if !acc.iter().any(Option::is_some) {
+        return None;
+    }
+    Some(
+        acc.into_iter()
+            .map(|range| range.unwrap_or((f32::INFINITY, f32::NEG_INFINITY)))
+            .collect(),
+    )
+}
+
+pub(super) fn matching_track_count(a: &[(f32, f32)], b: &[(f32, f32)]) -> (usize, usize) {
+    let (narrow, wide) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let matched = narrow
+        .iter()
+        .filter(|&&track| {
+            wide.iter().any(|&other| {
+                subset_match_score(track, other, TABLE_SUBSET_TRACK_TOLERANCE_PT).is_some()
+            })
+        })
+        .count();
+    (matched, narrow.len())
+}
+
+pub(super) fn absorb_cross_region_headers(lines: &[ProjectedLine], runs: &mut [TableRun]) {
+    let dbgt = *super::flags::DEBUG_TABLE;
+    let mut floor = 0;
+    for run in runs {
+        let needs_header = matches!(
+            &run.block,
+            Block::Table {
+                header: None,
+                rows
+            } if !rows.is_empty()
+        );
+        if needs_header && let Some(body_tracks) = cross_region_header_tracks(run, lines) {
+            if let Some((start, header, interstitials)) =
+                union_header_from_above(lines, run.body_start, floor, &body_tracks, true)
+            {
+                if dbgt {
+                    eprintln!(
+                        "[tbl-cross-region-header] absorbed lines {start}..{} into {} columns",
+                        run.body_start,
+                        header.len()
+                    );
+                }
+                run.start = start;
+                run.bbox = lines_bbox(lines, start, run.end);
+                run.interstitials = interstitials;
+                if let Block::Table {
+                    header: run_header, ..
+                } = &mut run.block
+                {
+                    *run_header = Some(header);
+                }
+            }
+        } else if needs_header && dbgt {
+            eprintln!("[tbl-cross-region-header] skip run: no body tracks");
+        }
+        floor = run.end;
+    }
 }
 
 fn tracks_align_same(a: &[(f32, f32)], b: &[(f32, f32)]) -> bool {
@@ -3685,6 +3987,219 @@ impl CellGrid {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProseBoundaryCrossing {
+    crossed: bool,
+    via: &'static str,
+    gap_width: Option<f32>,
+}
+
+type ProseXRange = (f32, f32);
+
+fn running_prose_sentence_shape(line: &ProjectedLine) -> bool {
+    let text = line.text.trim();
+    let char_count = text.chars().count();
+    let word_count = text.split_whitespace().count();
+    let non_space_count = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    let alpha_count = text.chars().filter(|ch| ch.is_alphabetic()).count();
+    char_count >= 90
+        && word_count >= 12
+        && non_space_count > 0
+        && alpha_count as f32 >= non_space_count as f32 * 0.6
+        && text.chars().any(|ch| matches!(ch, '.' | '!' | '?'))
+}
+
+fn prose_line_x_ranges(line: &ProjectedLine) -> (Vec<ProseXRange>, Vec<ProseXRange>) {
+    let mut words = Vec::new();
+    let mut item_only = Vec::new();
+    for span in line
+        .spans
+        .iter()
+        .filter(|span| !span.text.trim().is_empty())
+    {
+        if let Some(span_words) = verified_words(span) {
+            words.extend(span_words.into_iter().filter_map(|word| {
+                let x1 = word.x + word.width;
+                (word.width > 0.0 && x1.is_finite()).then_some((word.x, x1))
+            }));
+        } else if span.width > 0.0 {
+            item_only.push((span.x, span.x + span.width));
+        }
+    }
+    words.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (words, item_only)
+}
+
+fn prose_boundary_crossing(
+    boundary: f32,
+    word_ranges: &[ProseXRange],
+    item_only_ranges: &[ProseXRange],
+    gap_limit: f32,
+) -> ProseBoundaryCrossing {
+    const EDGE_MARGIN_PT: f32 = 1.5;
+    if word_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary >= x0 + EDGE_MARGIN_PT && boundary <= x1 - EDGE_MARGIN_PT)
+    {
+        return ProseBoundaryCrossing {
+            crossed: true,
+            via: "word-box",
+            gap_width: None,
+        };
+    }
+    for pair in word_ranges.windows(2) {
+        let gap_width = pair[1].0 - pair[0].1;
+        if gap_width >= 0.0 && boundary >= pair[0].1 && boundary <= pair[1].0 {
+            return ProseBoundaryCrossing {
+                crossed: gap_width < gap_limit,
+                via: if gap_width < gap_limit {
+                    "inter-word-gap"
+                } else {
+                    "wide-gap"
+                },
+                gap_width: Some(gap_width),
+            };
+        }
+    }
+    if word_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary > x0 && boundary < x1)
+    {
+        return ProseBoundaryCrossing {
+            crossed: false,
+            via: "word-edge-margin",
+            gap_width: None,
+        };
+    }
+    if item_only_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary >= x0 + EDGE_MARGIN_PT && boundary <= x1 - EDGE_MARGIN_PT)
+    {
+        return ProseBoundaryCrossing {
+            crossed: true,
+            via: "item-box",
+            gap_width: None,
+        };
+    }
+    if item_only_ranges
+        .iter()
+        .any(|&(x0, x1)| boundary > x0 && boundary < x1)
+    {
+        return ProseBoundaryCrossing {
+            crossed: false,
+            via: "item-edge-margin",
+            gap_width: None,
+        };
+    }
+    ProseBoundaryCrossing {
+        crossed: false,
+        via: "none",
+        gap_width: None,
+    }
+}
+
+fn prose_line_font_height(line: &ProjectedLine) -> f32 {
+    let mut heights: Vec<f32> = line
+        .spans
+        .iter()
+        .filter_map(|span| span.font_height.or(span.font_size))
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .collect();
+    heights.sort_by(f32::total_cmp);
+    heights
+        .get(heights.len() / 2)
+        .copied()
+        .or_else(|| {
+            (line.dominant_font_size.is_finite() && line.dominant_font_size > 0.0)
+                .then_some(line.dominant_font_size)
+        })
+        .unwrap_or_else(|| line.bbox.height.max(1.0))
+}
+
+fn should_stop_at_running_prose(
+    line: &ProjectedLine,
+    xs: &[f32],
+    row: usize,
+    idx: usize,
+    dbg: bool,
+) -> bool {
+    if !running_prose_sentence_shape(line) {
+        return false;
+    }
+    let boundaries: Vec<f32> = xs
+        .iter()
+        .copied()
+        .skip(1)
+        .take(xs.len().saturating_sub(2))
+        .collect();
+    let (word_ranges, item_only_ranges) = prose_line_x_ranges(line);
+    let geometry = match (word_ranges.is_empty(), item_only_ranges.is_empty()) {
+        (false, false) => "verified-word-boxes with item-box fallback",
+        (false, true) => "verified-word-boxes",
+        (true, false) => "item-level boxes (no verified word boxes)",
+        (true, true) => "no word or item boxes",
+    };
+    let line_x0 = line.bbox.x;
+    let line_x1 = line.bbox.x + line.bbox.width;
+    let font_height = prose_line_font_height(line);
+    let gap_limit = font_height * 0.5;
+    if boundaries.is_empty() {
+        if dbg {
+            eprintln!(
+                "[ruled] prose candidate line idx={idx} row={row} x={line_x0:.1}..{line_x1:.1} geometry={geometry}: no interior column boundaries; skip stop"
+            );
+        }
+        return false;
+    }
+    if dbg {
+        eprintln!(
+            "[ruled] prose candidate line idx={idx} row={row} x={line_x0:.1}..{line_x1:.1} font-height={font_height:.1} geometry={geometry} interior-boundaries={}",
+            boundaries.len()
+        );
+    }
+    let mut in_extent = 0usize;
+    let mut crossed = 0usize;
+    for boundary in boundaries {
+        let within_line = boundary >= line_x0 && boundary <= line_x1;
+        let decision = if within_line {
+            in_extent += 1;
+            prose_boundary_crossing(boundary, &word_ranges, &item_only_ranges, gap_limit)
+        } else {
+            ProseBoundaryCrossing {
+                crossed: false,
+                via: "outside-line",
+                gap_width: None,
+            }
+        };
+        if decision.crossed {
+            crossed += 1;
+        }
+        if dbg {
+            let gap_width = decision
+                .gap_width
+                .map_or_else(|| "n/a".to_string(), |gap| format!("{gap:.1}"));
+            eprintln!(
+                "[ruled] prose boundary idx={idx} x={boundary:.1} in_extent={} crossed={} via={} gap_width={gap_width} gap_limit={gap_limit:.1}",
+                if within_line { "yes" } else { "no" },
+                if decision.crossed { "yes" } else { "no" },
+                decision.via
+            );
+        }
+    }
+    let ratio = if in_extent == 0 {
+        0.0
+    } else {
+        crossed as f32 / in_extent as f32
+    };
+    let stop = in_extent >= 2 && crossed >= 2 && ratio >= 0.67;
+    if dbg {
+        eprintln!(
+            "[ruled] prose boundary decision idx={idx} crossed={crossed} in_extent={in_extent} ratio={ratio:.2} stop={stop}"
+        );
+    }
+    stop
+}
+
 /// Bin each line's text into the grid cells defined by column boundaries `xs`
 /// and row boundaries `ys`. A projected line frequently spans several ruled
 /// columns (one baseline = one line), so binning whole lines by centroid would
@@ -3700,6 +4215,7 @@ fn assign_cells(
     lines: &[ProjectedLine],
     xs: &[f32],
     ys: &[f32],
+    stop_at_running_prose: bool,
     dbg: bool,
 ) -> Option<(CellGrid, Vec<usize>)> {
     let n_rows = ys.len() - 1;
@@ -3722,6 +4238,77 @@ fn assign_cells(
     // is a no-op there.
     let mut line_order: Vec<usize> = (0..lines.len()).collect();
     line_order.sort_by(|&a, &b| lines[a].bbox.y.total_cmp(&lines[b].bbox.y));
+
+    // Running prose ends the table, but a full-width merged note row inside a
+    // ruled table ("(1) Amounts reflect the restatement described in Note 4,
+    // ...") has the same shape and is followed by further cell-aligned rows;
+    // stopping there would spill the rest of the table into loose lines. So a
+    // single prose line only stops the table below the last cell-aligned rows.
+    let prose_stop = if stop_at_running_prose {
+        let in_grid_row = |idx: usize| {
+            let line = &lines[idx];
+            let cy = line.bbox.y + line.bbox.height * 0.5;
+            if cy < ys[0] || cy > ys[n_rows] || line.text.trim().is_empty() {
+                return None;
+            }
+            find_bucket(ys, cy)
+        };
+        // A table row: text inside the grid, spread over 2+ columns, with no
+        // span straddling an interior boundary. A prose line's runs cut
+        // through the boundaries instead.
+        let is_cell_aligned_row = |line: &ProjectedLine| {
+            let line_x1 = line.bbox.x + line.bbox.width;
+            if line.bbox.x < xs[0] - GRID_X_SLACK_PT || line_x1 > xs[n_cols] + GRID_X_SLACK_PT {
+                return false;
+            }
+            let mut cols = HashSet::new();
+            for span in line.spans.iter().filter(|s| !s.text.trim().is_empty()) {
+                let m0 = (span.x + STRADDLE_MARGIN_PT).clamp(xs[0], xs[n_cols]);
+                let m1 = (span.x + span.width - STRADDLE_MARGIN_PT).clamp(xs[0], xs[n_cols]);
+                if m1 > m0 && find_bucket(xs, m0) != find_bucket(xs, m1) {
+                    return false;
+                }
+                let cx = (span.x + span.width * 0.5).clamp(xs[0], xs[n_cols]);
+                cols.extend(find_bucket(xs, cx));
+            }
+            cols.len() >= 2
+        };
+        let eligible: Vec<(usize, usize)> = line_order
+            .iter()
+            .filter_map(|&idx| in_grid_row(idx).map(|row| (idx, row)))
+            .collect();
+        // Require two table rows below a candidate: a single trailing line
+        // in 2+ columns is as likely a page footer as a table row.
+        let mut aligned_seen = 0usize;
+        let mut first_candidate = eligible.len();
+        for (pos, &(idx, _)) in eligible.iter().enumerate().rev() {
+            if is_cell_aligned_row(&lines[idx]) {
+                aligned_seen += 1;
+                if aligned_seen >= 2 {
+                    break;
+                }
+            }
+            first_candidate = pos;
+        }
+        // Above that cutoff, still stop when a second prose line follows: a
+        // paragraph between two tables sharing one ruled grid, or a form page
+        // interleaving prose with checkbox rows. A lone note row has neither.
+        let mut prose_positions = eligible
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(idx, row))| {
+                should_stop_at_running_prose(&lines[idx], xs, row, idx, dbg)
+            })
+            .map(|(pos, _)| pos);
+        match (prose_positions.next(), prose_positions.next()) {
+            (Some(pos), Some(_)) => Some(eligible[pos].0),
+            (Some(pos), None) if pos >= first_candidate => Some(eligible[pos].0),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     for idx in line_order {
         let line = &lines[idx];
         let cy = line.bbox.y + line.bbox.height * 0.5;
@@ -3738,6 +4325,15 @@ fn assign_cells(
         };
         if line.text.trim().is_empty() {
             continue;
+        }
+        if prose_stop == Some(idx) {
+            if dbg {
+                eprintln!(
+                    "[ruled] stop at running prose line idx={idx} row={row}: {:?}",
+                    line.text.chars().take(120).collect::<String>()
+                );
+            }
+            break;
         }
 
         // Only consume the line when its text sits inside the grid
@@ -4552,7 +5148,8 @@ fn build_ruled_table_from(
     // Assign text to cells, then reject if no lines landed inside the grid or
     // too many spans straddle interior column boundaries (decorative box, not
     // a table).
-    let (mut grid, consumed_indices) = assign_cells(lines, &xs, &ys, dbg)?;
+    let (mut grid, consumed_indices) =
+        assign_cells(lines, &xs, &ys, pass == RuledPass::Global, dbg)?;
     let straddle_frac = grid.straddle_frac;
     grid.spanned = rowspan_mask(hs, h_indices, vs, v_kept, &xs, &ys);
 
@@ -5208,6 +5805,240 @@ mod tests {
     use super::super::test_helpers::{line, line_with_spans, page, rect_borders, stroke};
     use super::*;
 
+    fn prose_test_words<'a>(
+        words: &'a [&'a str],
+        start_x: f32,
+        char_width: f32,
+        word_gap: f32,
+    ) -> Vec<(&'a str, f32, f32)> {
+        let mut x = start_x;
+        words
+            .iter()
+            .map(|word| {
+                let width = word.chars().count() as f32 * char_width;
+                let positioned = (*word, x, width);
+                x += width + word_gap;
+                positioned
+            })
+            .collect()
+    }
+
+    fn prose_test_span(words: &[(&str, f32, f32)], font_size: f32) -> crate::types::TextItem {
+        let x = words[0].1;
+        let end_x = words.last().map(|(_, x, width)| x + width).unwrap_or(x);
+        crate::types::TextItem {
+            text: words
+                .iter()
+                .map(|(word, _, _)| *word)
+                .collect::<Vec<_>>()
+                .join(" "),
+            x,
+            y: 0.0,
+            width: end_x - x,
+            height: font_size,
+            font_size: Some(font_size),
+            words: words
+                .iter()
+                .map(|(text, x, width)| crate::types::WordBox {
+                    text: (*text).into(),
+                    x: *x,
+                    y: 0.0,
+                    width: *width,
+                    height: font_size,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn prose_test_line(
+        text: &str,
+        spans: Vec<crate::types::TextItem>,
+        font_size: f32,
+    ) -> ProjectedLine {
+        let x0 = spans
+            .iter()
+            .map(|span| span.x)
+            .fold(f32::INFINITY, f32::min);
+        let x1 = spans
+            .iter()
+            .map(|span| span.x + span.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut line = line(text, x0, 0.0, font_size, font_size);
+        line.bbox = crate::types::Rect {
+            x: x0,
+            y: 0.0,
+            width: x1 - x0,
+            height: font_size,
+        };
+        line.spans = spans;
+        line
+    }
+
+    #[test]
+    fn justified_prose_crossing_three_ruled_columns_stops() {
+        let text = "During the year ended September 30, 2025, compensation expense increased $1.3 billion, or 2.8%, compared";
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let positions = prose_test_words(&words, 10.0, 3.0, 2.0);
+        let line = prose_test_line(text, vec![prose_test_span(&positions, 10.0)], 10.0);
+        let first_gap = positions[5].1 + positions[5].2 + 1.0;
+        let second_gap = positions[10].1 + positions[10].2 + 1.0;
+        let xs = [0.0, first_gap, second_gap, 330.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        assert!(should_stop_at_running_prose(&line, &xs, 0, 25, false));
+    }
+
+    #[test]
+    fn first_rent_comps_row_with_wide_cell_gaps_continues() {
+        let left_words = ["1", "Ashley", "Gables", "Buckhead", "530", "E", "Paces"];
+        let middle_words = ["Ferry", "Rd", "NE", "2019", "Residential"];
+        let right_words = ["94%", "325", "0.6", "Miles", "$2,443"];
+        let left_positions = prose_test_words(&left_words, 10.0, 2.0, 2.0);
+        let middle_positions = prose_test_words(&middle_words, 120.0, 2.0, 2.0);
+        let right_positions = prose_test_words(&right_words, 220.0, 2.0, 2.0);
+        let text = "1 Ashley Gables Buckhead 530 E Paces Ferry Rd NE 2019 Residential 94% 325 0.6 Miles $2,443";
+        let line = prose_test_line(
+            text,
+            vec![
+                prose_test_span(&left_positions, 10.0),
+                prose_test_span(&middle_positions, 10.0),
+                prose_test_span(&right_positions, 10.0),
+            ],
+            10.0,
+        );
+        let xs = [0.0, 100.0, 200.0, 300.0];
+        let ys = [0.0, 20.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        let (_, consumed) = assign_cells(&[line], &xs, &ys, true, false).unwrap();
+        assert_eq!(
+            consumed,
+            [0],
+            "the first data row has no prior assigned cells"
+        );
+    }
+
+    fn at_y(mut line: ProjectedLine, y: f32) -> ProjectedLine {
+        line.bbox.y = y;
+        for span in &mut line.spans {
+            span.y = y;
+            for word in &mut span.words {
+                word.y = y;
+            }
+        }
+        line
+    }
+
+    fn data_row(cells: &[&str], y: f32) -> ProjectedLine {
+        let spans: Vec<_> = cells
+            .iter()
+            .enumerate()
+            .map(|(c, text)| {
+                let words = [*text];
+                prose_test_span(
+                    &prose_test_words(&words, 10.0 + 100.0 * c as f32, 5.0, 2.0),
+                    10.0,
+                )
+            })
+            .collect();
+        at_y(prose_test_line(&cells.join(" "), spans, 10.0), y)
+    }
+
+    fn prose_row(y: f32) -> ProjectedLine {
+        let text = "During the year ended September 30, 2025, compensation expense increased $1.3 billion, or 2.8%, compared";
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let positions = prose_test_words(&words, 10.0, 3.0, 2.0);
+        at_y(
+            prose_test_line(text, vec![prose_test_span(&positions, 10.0)], 10.0),
+            y,
+        )
+    }
+
+    #[test]
+    fn merged_note_row_mid_table_keeps_rows_below() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            prose_row(25.0),
+            data_row(&["Debt", "500", "600"], 45.0),
+            data_row(&["Equity", "500", "300"], 65.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
+
+        assert!(should_stop_at_running_prose(&lines[1], &xs, 1, 1, false));
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn prose_paragraph_between_tables_stops() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            prose_row(25.0),
+            prose_row(45.0),
+            data_row(&["Debt", "500", "600"], 65.0),
+            data_row(&["Equity", "500", "300"], 85.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
+
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0]);
+    }
+
+    #[test]
+    fn running_prose_below_table_still_stops() {
+        let lines = vec![
+            data_row(&["Cash", "1,000", "900"], 5.0),
+            data_row(&["Debt", "500", "600"], 25.0),
+            prose_row(45.0),
+            prose_row(65.0),
+        ];
+        let xs = [0.0, 100.0, 200.0, 330.0];
+        let ys = [0.0, 20.0, 40.0, 60.0, 80.0];
+
+        let (_, consumed) = assign_cells(&lines, &xs, &ys, true, false).unwrap();
+        assert_eq!(consumed, [0, 1]);
+    }
+
+    #[test]
+    fn long_left_column_label_with_right_column_numbers_continues() {
+        let label = "The subject property benefits from recent renovations and convenient access to neighborhood services.";
+        let text = format!("{label} $1,250 2025");
+        let spans = vec![
+            crate::types::TextItem {
+                text: label.into(),
+                x: 10.0,
+                y: 0.0,
+                width: 270.0,
+                height: 10.0,
+                ..Default::default()
+            },
+            crate::types::TextItem {
+                text: "$1,250".into(),
+                x: 330.0,
+                y: 0.0,
+                width: 30.0,
+                height: 10.0,
+                ..Default::default()
+            },
+            crate::types::TextItem {
+                text: "2025".into(),
+                x: 520.0,
+                y: 0.0,
+                width: 24.0,
+                height: 10.0,
+                ..Default::default()
+            },
+        ];
+        let line = prose_test_line(&text, spans, 10.0);
+        let xs = [0.0, 300.0, 500.0, 680.0];
+
+        assert!(running_prose_sentence_shape(&line));
+        assert!(!should_stop_at_running_prose(&line, &xs, 0, 0, false));
+    }
+
     /// One PDFium run whose words sit at the given (x, width) positions.
     fn run_with_words(words: &[(&str, f32, f32)]) -> TextItem {
         let x = words[0].1;
@@ -5306,6 +6137,81 @@ mod tests {
         v.iter()
             .map(|r| r.iter().map(|s| Cell::from(*s)).collect())
             .collect()
+    }
+
+    #[test]
+    fn spanning_year_header_covers_both_subcolumns() {
+        // #487: a year centered over `Mill. u$s | Part.`.
+        let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
+        let year = TableCell {
+            start_x: 170.0,
+            end_x: 186.0,
+            text: "2001".to_string(),
+            bold: false,
+        };
+        assert_eq!(spanning_track_indices(&year, &tracks), vec![0, 1]);
+        let mill = TableCell {
+            start_x: 152.0,
+            end_x: 167.0,
+            text: "Mill.".to_string(),
+            bold: false,
+        };
+        assert_eq!(spanning_track_indices(&mill, &tracks), vec![0]);
+    }
+
+    #[test]
+    fn year_header_is_eligible_to_name_both_subcolumns() {
+        let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
+        let year = TableCell {
+            start_x: 170.0,
+            end_x: 186.0,
+            text: "2001".to_string(),
+            bold: false,
+        };
+        let covered = spanning_track_indices(&year, &tracks);
+        assert_eq!(covered, vec![0, 1]);
+        assert!(spanning_header_eligible(&year, &covered, &tracks, 2));
+    }
+
+    #[test]
+    fn single_header_line_never_replicates() {
+        let tracks = vec![(152.0, 167.0), (179.0, 195.0)];
+        let year = TableCell {
+            start_x: 170.0,
+            end_x: 186.0,
+            text: "2001".to_string(),
+            bold: false,
+        };
+        let covered = spanning_track_indices(&year, &tracks);
+        assert!(!spanning_header_eligible(&year, &covered, &tracks, 1));
+    }
+
+    #[test]
+    fn wide_single_token_header_stays_in_its_column() {
+        // Bleeds into the next track but is centered in its own column.
+        let tracks = vec![(100.0, 150.0), (160.0, 200.0)];
+        let cell = TableCell {
+            start_x: 100.0,
+            end_x: 165.0,
+            text: "Revenue".to_string(),
+            bold: false,
+        };
+        let covered = spanning_track_indices(&cell, &tracks);
+        assert_eq!(covered, vec![0, 1]);
+        assert!(!spanning_header_eligible(&cell, &covered, &tracks, 2));
+    }
+
+    #[test]
+    fn prose_header_never_replicates() {
+        let tracks = vec![(100.0, 150.0), (160.0, 200.0)];
+        let cell = TableCell {
+            start_x: 95.0,
+            end_x: 205.0,
+            text: "Clasificacion por grandes rubros".to_string(),
+            bold: false,
+        };
+        let covered = spanning_track_indices(&cell, &tracks);
+        assert!(!spanning_header_eligible(&cell, &covered, &tracks, 2));
     }
 
     #[test]
