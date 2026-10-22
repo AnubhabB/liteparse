@@ -7,10 +7,34 @@ import { formatText } from "./cli-text.js";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join, relative, parse as parsePath } from "node:path";
 
+/**
+ * The package version, read from the package.json that ships next to `dist/`
+ * (`dist/cli.js` -> `../package.json`, both in a checkout and when installed),
+ * so `--version` can never drift from the published version.
+ */
+function readPackageVersion(): string {
+  try {
+    const pkg: unknown = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+    );
+    if (
+      typeof pkg === "object" &&
+      pkg !== null &&
+      "version" in pkg &&
+      typeof pkg.version === "string"
+    ) {
+      return pkg.version;
+    }
+  } catch {
+    // Fall through: an unreadable package.json must not break every command.
+  }
+  return "unknown";
+}
+
 program
   .name("liteparse")
   .description("Fast, lightweight PDF and document parsing")
-  .version("2.0.0");
+  .version(readPackageVersion());
 
 /**
  * Resolve a CLI `<file>` argument into a parser input. `-` means read the
@@ -439,6 +463,12 @@ program
           );
         }
 
+        // Outputs are named `<stem><ext>`, so `report.pdf` and `report.png`
+        // would both land on `report.txt` and the later one would silently
+        // overwrite the earlier one. Refuse up front, before parsing or
+        // writing anything.
+        assertNoOutputCollisions(files, inputDir, outputDir, outExt);
+
         let success = 0;
         let errors = 0;
 
@@ -446,11 +476,7 @@ program
           const t0 = Date.now();
           const rel = relative(inputDir, filePath);
           const parsed = parsePath(rel);
-          const outPath = join(
-            outputDir,
-            parsed.dir,
-            parsed.name + outExt,
-          );
+          const outPath = batchOutputPath(filePath, inputDir, outputDir, outExt);
           mkdirSync(join(outputDir, parsed.dir), { recursive: true });
 
           try {
@@ -496,14 +522,65 @@ program
     },
   );
 
+// Keep in sync with the extension lists in crates/liteparse/src/conversion.rs.
+// Plain-text formats (.txt, .md, .markdown, .log) are deliberately absent: the
+// parser rejects them ("unsupported file format"), so scanning them would only
+// turn every such file in a directory into a reported failure.
 const SUPPORTED_EXTENSIONS = new Set([
   ".pdf",
   ".doc", ".docx", ".docm", ".dot", ".dotm", ".dotx", ".odt", ".ott", ".rtf", ".pages",
   ".ppt", ".pptx", ".pptm", ".pot", ".potm", ".potx", ".odp", ".otp", ".key",
   ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".ots", ".csv", ".tsv", ".numbers",
   ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".svg",
-  ".txt", ".md", ".markdown", ".log",
 ]);
+
+/** Where `batch-parse` writes the output for `filePath`. */
+function batchOutputPath(
+  filePath: string,
+  inputDir: string,
+  outputDir: string,
+  outExt: string,
+): string {
+  const parsed = parsePath(relative(inputDir, filePath));
+  return join(outputDir, parsed.dir, parsed.name + outExt);
+}
+
+/**
+ * Throw if two inputs would be written to the same output file. Paths are
+ * compared case-insensitively on Windows and macOS, whose default file systems
+ * would make `Report.txt` and `report.txt` the same file.
+ */
+function assertNoOutputCollisions(
+  files: string[],
+  inputDir: string,
+  outputDir: string,
+  outExt: string,
+): void {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  const byOutput = new Map<string, { outPath: string; inputs: string[] }>();
+  for (const filePath of files) {
+    const outPath = batchOutputPath(filePath, inputDir, outputDir, outExt);
+    const key = caseInsensitive ? outPath.toLowerCase() : outPath;
+    const entry = byOutput.get(key);
+    if (entry) entry.inputs.push(filePath);
+    else byOutput.set(key, { outPath, inputs: [filePath] });
+  }
+
+  const collisions = [...byOutput.values()].filter((entry) => entry.inputs.length > 1);
+  if (collisions.length === 0) return;
+
+  const shown = collisions
+    .slice(0, 10)
+    .map(({ outPath, inputs }) => `  ${outPath} <- ${inputs.join(", ")}`);
+  if (collisions.length > shown.length) {
+    shown.push(`  ... and ${collisions.length - shown.length} more`);
+  }
+  throw new Error(
+    `output path collision: multiple input files would be written to the same output file:\n` +
+      `${shown.join("\n")}\n` +
+      `Rename the inputs, or process one file type at a time with --extension (e.g. --extension pdf).`,
+  );
+}
 
 function collectFiles(
   dir: string,
